@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ./dist
+          
+          Copy-Item -Path ./target/release/klwp-spad.exe -Destination ./dist/klwp-spad.exe
+          
+          @"
+          KLWP SPAD v${{ github.ref_name }}
+          
+          To run the soundboard:
+          1. Extract the zip archive contents into a folder.
+          2. Run klwp-spad.exe.
+          3. Complete the first time setup.
+          "@ | Out-File -FilePath ./dist/README.txt -Encoding utf8
+
+      - name: Compress release files to ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path ./dist/* -DestinationPath ./klwp-spad-windows-x64.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: klwp-spad-windows-x64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
