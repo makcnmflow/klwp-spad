@@ -1,3 +1,4 @@
+// This attribute hides the console window on release builds, but keeps it on debug builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
