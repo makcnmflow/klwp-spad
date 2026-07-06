@@ -176,7 +176,7 @@ impl SoundpadApp {
             let auto_cable_mic = find_virtual_cable_microphone(&app.config.selected_output, &app.input_devices);
             set_default_windows_microphone(&auto_cable_mic);
         } else {
-            app.status_message = "Please complete the initial device setup.".to_string();
+            app.status_message = "Please complete the first time setup.".to_string();
             app.log_warn("Awaiting first-run configuration setup...");
         }
 
@@ -1305,10 +1305,10 @@ impl eframe::App for SoundpadApp {
                             });
 
                             ui.separator();
-                            ui.checkbox(&mut self.config.verify_config_startup, "Verify device configuration on startup");
-                            ui.checkbox(&mut self.config.disable_drm_check, "Disable DRM checks for Windows Audio services");
-                            ui.checkbox(&mut self.config.block_echo, "Block self-monitoring microphone echo loop");
-                            ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute physical microphone while a sound is playing");
+                            ui.checkbox(&mut self.config.verify_config_startup, "Verify device configuration on startup (DO NOT SET IT OFF ONLY IF YOU KNOW WHAT YOU DOIN)");
+                            ui.checkbox(&mut self.config.disable_drm_check, "Disable DRM checks for Windows Audio services (audiodg.exe)");
+                            ui.checkbox(&mut self.config.block_echo, "Block self-monitoring microphone echo loop (you already know what it doin)");
+                            ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute physical microphone while a sound is playing (quack)");
                         }
                         SettingsTab::Hotkeys => {
                             ui.label("Global Hotkey Manager:");
