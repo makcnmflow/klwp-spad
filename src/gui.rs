@@ -176,7 +176,7 @@ impl SoundpadApp {
             let auto_cable_mic = find_virtual_cable_microphone(&app.config.selected_output, &app.input_devices);
             set_default_windows_microphone(&auto_cable_mic);
         } else {
-            app.status_message = "Please complete the first time setup.".to_string();
+            app.status_message = "Please complete the initial device setup.".to_string();
             app.log_warn("Awaiting first-run configuration setup...");
         }
 
@@ -340,28 +340,38 @@ impl SoundpadApp {
 
                 let mut pushed_something = false;
 
-                if !mic_done {
-                    if prod_mic.is_full() {
-                    } else if let Some(sample) = mic_iter.next() {
-                        let _ = prod_mic.push(sample);
-                        pushed_something = true;
-                    } else {
-                        mic_done = true;
+                for _ in 0..512 {
+                    if !mic_done {
+                        if prod_mic.is_full() {
+                            break;
+                        } else if let Some(sample) = mic_iter.next() {
+                            if prod_mic.push(sample).is_err() {
+                                return;
+                            }
+                            pushed_something = true;
+                        } else {
+                            mic_done = true;
+                        }
                     }
                 }
 
-                if !head_done {
-                    if prod_head.is_full() {
-                    } else if let Some(sample) = head_iter.next() {
-                        let _ = prod_head.push(sample);
-                        pushed_something = true;
-                    } else {
-                        head_done = true;
+                for _ in 0..512 {
+                    if !head_done {
+                        if prod_head.is_full() {
+                            break;
+                        } else if let Some(sample) = head_iter.next() {
+                            if prod_head.push(sample).is_err() {
+                                return;
+                            }
+                            pushed_something = true;
+                        } else {
+                            head_done = true;
+                        }
                     }
                 }
 
                 if !pushed_something {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
 
@@ -472,7 +482,14 @@ impl SoundpadApp {
         let url_clone = url.clone();
 
         std::thread::spawn(move || {
-            let output = std::process::Command::new("curl")
+            let mut cmd = std::process::Command::new("curl");
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+
+            let output = cmd
                 .args(&[
                     "-L",
                     "-k",
@@ -515,7 +532,7 @@ impl SoundpadApp {
             }
         });
     }
-// if voicemod will change their title format i will kill them im too lazy to fix it lol
+
     fn trigger_voicemod_download(&mut self, uuid: String, category_idx: usize) {
         self.status_message = "Locating download link on Voicemod Tuna...".to_string();
         self.log_info(&format!("Scraping Voicemod Tuna for UUID: {}", uuid));
@@ -525,7 +542,14 @@ impl SoundpadApp {
         std::thread::spawn(move || {
             let sound_page_url = format!("https://tuna.voicemod.net/sound/{}", uuid);
 
-            let output = std::process::Command::new("curl")
+            let mut cmd1 = std::process::Command::new("curl");
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd1.creation_flags(0x08000000);
+            }
+
+            let output = cmd1
                 .args(&[
                     "-L",
                     "-k",
@@ -573,7 +597,14 @@ impl SoundpadApp {
                             let destination_path = dir.join(&safe_filename);
                             let dest_str = destination_path.display().to_string();
 
-                            let curl_download = std::process::Command::new("curl")
+                            let mut cmd2 = std::process::Command::new("curl");
+                            #[cfg(target_os = "windows")]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                cmd2.creation_flags(0x08000000);
+                            }
+
+                            let curl_download = cmd2
                                 .args(&[
                                     "-L",
                                     "-k",
@@ -1305,10 +1336,10 @@ impl eframe::App for SoundpadApp {
                             });
 
                             ui.separator();
-                            ui.checkbox(&mut self.config.verify_config_startup, "Verify device configuration on startup (DO NOT SET IT OFF ONLY IF YOU KNOW WHAT YOU DOIN)");
-                            ui.checkbox(&mut self.config.disable_drm_check, "Disable DRM checks for Windows Audio services (audiodg.exe)");
-                            ui.checkbox(&mut self.config.block_echo, "Block self-monitoring microphone echo loop (you already know what it doin)");
-                            ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute physical microphone while a sound is playing (quack)");
+                            ui.checkbox(&mut self.config.verify_config_startup, "Verify device configuration on startup");
+                            ui.checkbox(&mut self.config.disable_drm_check, "Disable DRM checks for Windows Audio services");
+                            ui.checkbox(&mut self.config.block_echo, "Block self-monitoring microphone echo loop");
+                            ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute physical microphone while a sound is playing");
                         }
                         SettingsTab::Hotkeys => {
                             ui.label("Global Hotkey Manager:");
@@ -1406,14 +1437,14 @@ impl eframe::App for SoundpadApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    egui::RichText::new("KLWP SPAD")
+                                    egui::RichText::new("K L W P - S P A D")
                                         .size(36.0)
                                         .strong()
                                         .monospace()
                                         .color(accent),
                                 );
                                 ui.label(
-                                    egui::RichText::new("means killwinparty soundpad")
+                                    egui::RichText::new("V E R S I O N   2 . 0")
                                         .size(14.0)
                                         .monospace()
                                         .color(egui::Color32::GRAY),
@@ -1422,7 +1453,7 @@ impl eframe::App for SoundpadApp {
                                 ui.label(egui::RichText::new("Created by killwinparty (klwp)").strong());
                                 ui.add_space(5.0);
                                 ui.small("An advanced Soundpad clone made with Rust.");
-                                ui.small("I made this like in one day XD.");
+                                ui.small("I made this like in one day lmao 😭😭😭");
                             });
                         }
                     }

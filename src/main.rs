@@ -1,14 +1,30 @@
-use eframe::egui; 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod audio;
 mod utils;
 mod discord;
 mod gui;
 
+use eframe::egui;
 use egui_phosphor::{add_to_fonts, Variant};
 use gui::{DownloadResult, SoundpadApp};
 use std::sync::{Arc, Mutex};
 use utils::register_custom_protocol;
+
+fn load_icon() -> eframe::egui::IconData {
+    let icon_bytes = include_bytes!("icon.ico");
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Failed to decode embedded ico icon")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    eframe::egui::IconData {
+        rgba,
+        width,
+        height,
+    }
+}
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -51,7 +67,12 @@ fn main() -> eframe::Result<()> {
 
             let (tx, rx) = std::sync::mpsc::channel::<DownloadResult>();
 
-            let options = eframe::NativeOptions::default();
+            let options = eframe::NativeOptions {
+                viewport: eframe::egui::ViewportBuilder::default()
+                    .with_icon(load_icon()),
+                ..Default::default()
+            };
+
             eframe::run_native(
                 "klwp-spad",
                 options,
