@@ -1437,14 +1437,14 @@ impl eframe::App for SoundpadApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    egui::RichText::new("K L W P - S P A D")
+                                    egui::RichText::new("KLWP SPAD")
                                         .size(36.0)
                                         .strong()
                                         .monospace()
                                         .color(accent),
                                 );
                                 ui.label(
-                                    egui::RichText::new("V E R S I O N   2 . 0")
+                                    egui::RichText::new("it means killwinparty soundpad")
                                         .size(14.0)
                                         .monospace()
                                         .color(egui::Color32::GRAY),
@@ -1452,8 +1452,8 @@ impl eframe::App for SoundpadApp {
                                 ui.add_space(15.0);
                                 ui.label(egui::RichText::new("Created by killwinparty (klwp)").strong());
                                 ui.add_space(5.0);
-                                ui.small("An advanced Soundpad clone made with Rust.");
-                                ui.small("I made this like in one day lmao 😭😭😭");
+                                ui.small("A simple Soundpad clone made with Rust.");
+                                ui.small("I made this like in one day XD");
                             });
                         }
                     }
