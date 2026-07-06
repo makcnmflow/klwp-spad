@@ -72,6 +72,10 @@ pub struct SoundpadApp {
     pub current_download: Option<QueuedDownload>,
     pub download_progress: f32,
     pub discord_tx: std::sync::mpsc::Sender<DiscordMsg>,
+
+    // Update check variables
+    pub update_rx: std::sync::mpsc::Receiver<String>,
+    pub update_available: Option<String>,
 }
 
 impl SoundpadApp {
@@ -133,6 +137,46 @@ impl SoundpadApp {
 
         let discord_tx = spawn_discord_rpc_thread();
 
+        // Spawn a background thread to check for the latest release tag on GitHub
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+        let update_tx_clone = update_tx.clone();
+
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("curl");
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let output = cmd
+                .args(&[
+                    "-s",
+                    "-L",
+                    "-H", "Accept: application/vnd.github+json",
+                    "-A", "Mozilla/5.0",
+                    "https://api.github.com/repos/makcnmflow/klwp-spad/releases/latest"
+                ])
+                .output();
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let json_str = String::from_utf8_lossy(&out.stdout);
+                    
+                    #[derive(serde::Deserialize)]
+                    struct GitHubRelease {
+                        tag_name: String,
+                    }
+
+                    if let Ok(release) = serde_json::from_str::<GitHubRelease>(&json_str) {
+                        let current_ver = env!("APP_VERSION");
+                        if release.tag_name != current_ver {
+                            let _ = update_tx_clone.send(release.tag_name);
+                        }
+                    }
+                }
+            }
+        });
+
         let mut app = Self {
             input_devices,
             output_devices,
@@ -163,6 +207,8 @@ impl SoundpadApp {
             current_download: None,
             download_progress: 0.0,
             discord_tx,
+            update_rx,
+            update_available: None,
         };
 
         app.log_info("System initialized successfully.");
@@ -822,6 +868,12 @@ impl eframe::App for SoundpadApp {
             }
         }
 
+        // Receive update tag from our background thread channel
+        while let Ok(tag) = self.update_rx.try_recv() {
+            self.update_available = Some(tag.clone());
+            self.log_info(&format!("New version found on GitHub! Version: {}", tag));
+        }
+
         egui::TopBottomPanel::top("top_menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -983,6 +1035,19 @@ impl eframe::App for SoundpadApp {
                 if !self.download_queue.is_empty() {
                     ui.separator();
                     ui.label(format!("Queue: {} item(s)", self.download_queue.len()));
+                }
+
+                // If an update is found, draw a clean link button right in the footer
+                if let Some(ref tag) = self.update_available {
+                    ui.separator();
+                    let btn_text = format!("⚡ Update Available: {} - View Release", tag);
+                    let btn = ui.button(egui::RichText::new(btn_text).color(egui::Color32::LIGHT_GREEN));
+                    if btn.clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(format!(
+                            "https://github.com/makcnmflow/klwp-spad/releases/tag/{}",
+                            tag
+                        )));
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1454,6 +1519,16 @@ impl eframe::App for SoundpadApp {
                                 ui.add_space(5.0);
                                 ui.small("A simple Soundpad clone made with Rust.");
                                 ui.small("I made this like in one day XD");
+                            });
+
+                            // Display the auto-injected version at the bottom left of the About tab
+                            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                                let version = env!("APP_VERSION");
+                                if version.starts_with('1') || version.starts_with('2') || version.starts_with('0') {
+                                    ui.small(format!("v{}", version));
+                                } else {
+                                    ui.small(version);
+                                }
                             });
                         }
                     }
