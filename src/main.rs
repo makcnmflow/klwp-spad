@@ -73,7 +73,6 @@ pub struct SoundpadApp {
     pub download_progress: f32,
     pub discord_tx: std::sync::mpsc::Sender<DiscordMsg>,
 
-    // Update check variables
     pub update_rx: std::sync::mpsc::Receiver<String>,
     pub update_available: Option<String>,
 }
@@ -137,7 +136,6 @@ impl SoundpadApp {
 
         let discord_tx = spawn_discord_rpc_thread();
 
-        // Spawn a background thread to check for the latest release tag on GitHub
         let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
         let update_tx_clone = update_tx.clone();
 
@@ -868,7 +866,6 @@ impl eframe::App for SoundpadApp {
             }
         }
 
-        // Receive update tag from our background thread channel
         while let Ok(tag) = self.update_rx.try_recv() {
             self.update_available = Some(tag.clone());
             self.log_info(&format!("New version found on GitHub! Version: {}", tag));
@@ -1036,8 +1033,6 @@ impl eframe::App for SoundpadApp {
                     ui.separator();
                     ui.label(format!("Queue: {} item(s)", self.download_queue.len()));
                 }
-
-                // If an update is found, draw a clean link button right in the footer
                 if let Some(ref tag) = self.update_available {
                     ui.separator();
                     let btn_text = format!("⚡ Update Available: {} - View Release", tag);
@@ -1521,7 +1516,6 @@ impl eframe::App for SoundpadApp {
                                 ui.small("I made this like in one day XD");
                             });
 
-                            // Display the auto-injected version at the bottom left of the About tab
                             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                 let version = env!("APP_VERSION");
                                 if version.starts_with('1') || version.starts_with('2') || version.starts_with('0') {
