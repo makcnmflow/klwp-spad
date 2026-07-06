@@ -50,7 +50,7 @@ pub fn spawn_discord_rpc_thread() -> std::sync::mpsc::Sender<DiscordMsg> {
                                 .large_image("icon")
                                 .large_text("KLWP SPAD");
                             act = act.assets(assets);
-
+// YES ITS A FREE AD FOR THIS PROJECT AND WHAT ARE YOU GONNA DO WITH THAT HAHAHA
                             let button = activity::Button::new("Download Ts On Github!", "https://github.com/makcnmflow/klwp-spad");
                             act = act.buttons(vec![button]);
 
