@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use utils::register_custom_protocol;
 
 fn load_icon() -> eframe::egui::IconData {
-    let icon_bytes = include_bytes!("icon.ico");
+    let icon_bytes = include_bytes!("../icon.ico");
     let image = image::load_from_memory(icon_bytes)
         .expect("Failed to decode embedded ico icon")
         .into_rgba8();

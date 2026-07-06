@@ -3,7 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'pv*'
+      - 'rv*'
+      - 'nv*'
 
 permissions:
   contents: write
@@ -15,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -24,6 +28,38 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Determine Release Type and Description
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          
+          if ($tag -like "rv*") {
+              $clean_ver = $tag.Substring(2)
+              "RELEASE_NAME=Stable Release $clean_ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+              "IS_PRERELEASE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } elseif ($tag -like "pv*") {
+              $clean_ver = $tag.Substring(2)
+              "RELEASE_NAME=Pre-release $clean_ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+              "IS_PRERELEASE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } elseif ($tag -like "nv*") {
+              $clean_ver = $tag.Substring(2)
+              "RELEASE_NAME=Nightly Build $clean_ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+              "IS_PRERELEASE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+              "RELEASE_NAME=Release $tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+              "IS_PRERELEASE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+          $tag_message = (git tag -l --format="%(contents)" $tag).Trim()
+
+          if (![string]::IsNullOrEmpty($tag_message)) {
+              $tag_message | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
+          } elseif (Test-Path ./release_notes.txt) {
+              Copy-Item -Path ./release_notes.txt -Destination ./RELEASE_BODY.md
+          } else {
+              "Automated build and deploy for version $tag." | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
+          }
 
       - name: Build release binary
         run: cargo build --release
@@ -36,12 +72,13 @@ jobs:
           Copy-Item -Path ./target/release/klwp-spad.exe -Destination ./dist/klwp-spad.exe
           
           @"
-          KLWP SPAD v${{ github.ref_name }}
+          KLWP-SPAD v${{ github.ref_name }}
           
           To run the soundboard:
           1. Extract the zip archive contents into a folder.
-          2. Run klwp-spad.exe.
-          3. Complete the first time setup.
+          2. Install https://vb-audio.com/Cable/
+          3. Run klwp-spad.exe.
+          4. Complete the first setup.
           "@ | Out-File -FilePath ./dist/README.txt -Encoding utf8
 
       - name: Compress release files to ZIP
@@ -53,7 +90,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: klwp-spad-windows-x64.zip
+          name: ${{ env.RELEASE_NAME }}
+          body_path: ./RELEASE_BODY.md
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
           draft: false
-          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
