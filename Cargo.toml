@@ -1,12 +1,12 @@
 [package]
 name = "klwp-spad"
-version = "1.4.90"
+version = "1.9.0"
 edition = "2021"
 
 [dependencies]
 eframe = "0.26.2"
 cpal = "0.15.3"
-rodio = { version = "0.17.3", features = ["mp3", "wav"] }
+rodio = { version = "0.17.3", features = ["mp3", "wav", "vorbis", "flac"] }
 ringbuf = "0.3.3"
 rfd = "0.15.3"
 serde = { version = "1.0", features = ["derive"] }

@@ -204,6 +204,60 @@ Add-Type -TypeDefinition $code -ErrorAction SilentlyContinue
         .output();
 }
 
+fn ffmpeg_path() -> Option<String> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for candidate in &[
+        exe_dir.join("libs").join("ffmpeg.exe"),
+        exe_dir.join("ffmpeg.exe"),
+    ] {
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Some("ffmpeg".to_string());
+    }
+    None
+}
+
+pub fn try_convert_with_ffmpeg(path: &str) -> Option<String> {
+    let ffmpeg = ffmpeg_path()?;
+
+    let input = std::path::Path::new(path);
+    let stem = input.file_stem()?.to_string_lossy();
+
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let out_dir = exe_dir.join("sounds");
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    let output_path = out_dir.join(format!("{}_converted.wav", stem));
+    let output_str = output_path.display().to_string();
+
+    let status = std::process::Command::new(&ffmpeg)
+        .args(&[
+            "-y",
+            "-i", path,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "44100",
+            "-ac", "2",
+            &output_str,
+        ])
+        .output()
+        .ok()?;
+
+    if status.status.success() && output_path.exists() {
+        Some(output_str)
+    } else {
+        None
+    }
+}
+
 pub fn register_custom_protocol() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe()?;
     let exe_str = exe_path.display().to_string().replace("\\", "\\\\");

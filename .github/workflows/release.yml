@@ -61,6 +61,17 @@ jobs:
               "Automated build and deploy for version $tag." | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
           }
 
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $zipPath = "$env:TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\ffmpeg" -Force
+          $exe = Get-ChildItem -Path "$env:TEMP\ffmpeg" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "./target/release/libs"
+          Copy-Item -Path $exe.FullName -Destination "./target/release/libs/ffmpeg.exe"
+
       - name: Build release binary
         run: cargo build --release
 
@@ -70,6 +81,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path ./dist
           
           Copy-Item -Path ./target/release/klwp-spad.exe -Destination ./dist/klwp-spad.exe
+          if (Test-Path ./target/release/libs/ffmpeg.exe) {
+            New-Item -ItemType Directory -Force -Path ./dist/libs
+            Copy-Item -Path ./target/release/libs/ffmpeg.exe -Destination ./dist/libs/ffmpeg.exe
+          }
           
           @"
           KLWP-SPAD v${{ github.ref_name }}

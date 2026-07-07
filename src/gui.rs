@@ -5,7 +5,8 @@ use crate::audio::{
 use crate::config::{get_exe_dir, load_config, save_config, AppConfig, CategoryConfig, SoundConfig};
 use crate::discord::{spawn_discord_rpc_thread, DiscordMsg};
 use crate::utils::{
-    parse_soundpad_protocol, parse_voicemod_protocol, set_default_windows_microphone, url_decode,
+    parse_soundpad_protocol, parse_voicemod_protocol, set_default_windows_microphone,
+    try_convert_with_ffmpeg, url_decode,
 };
 
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -72,6 +73,8 @@ pub struct SoundpadApp {
     pub current_download: Option<QueuedDownload>,
     pub download_progress: f32,
     pub discord_tx: std::sync::mpsc::Sender<DiscordMsg>,
+    pub update_rx: std::sync::mpsc::Receiver<String>,
+    pub update_available: Option<String>,
 }
 
 impl SoundpadApp {
@@ -133,6 +136,50 @@ impl SoundpadApp {
 
         let discord_tx = spawn_discord_rpc_thread();
 
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+        let update_tx_clone = update_tx.clone();
+
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("curl");
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let output = cmd
+                .args(&[
+                    "-s",
+                    "-L",
+                    "-H", "Accept: application/vnd.github+json",
+                    "-A", "Mozilla/5.0",
+                    "https://api.github.com/repos/makcnmflow/klwp-spad/releases/latest"
+                ])
+                .output();
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let json_str = String::from_utf8_lossy(&out.stdout);
+                    
+                    #[derive(serde::Deserialize)]
+                    struct GitHubRelease {
+                        tag_name: String,
+                    }
+
+                    fn strip_ver_prefix(s: &str) -> &str {
+                        s.trim_start_matches(|c: char| c.is_alphabetic())
+                    }
+
+                    if let Ok(release) = serde_json::from_str::<GitHubRelease>(&json_str) {
+                        let current_ver = strip_ver_prefix(env!("APP_VERSION"));
+                        let latest_tag = strip_ver_prefix(&release.tag_name);
+                        if latest_tag != current_ver {
+                            let _ = update_tx_clone.send(release.tag_name);
+                        }
+                    }
+                }
+            }
+        });
+
         let mut app = Self {
             input_devices,
             output_devices,
@@ -163,6 +210,8 @@ impl SoundpadApp {
             current_download: None,
             download_progress: 0.0,
             discord_tx,
+            update_rx,
+            update_available: None,
         };
 
         app.log_info("System initialized successfully.");
@@ -473,7 +522,7 @@ impl SoundpadApp {
             safe_filename
         };
 
-        let dir = get_exe_dir().join("downloaded_sounds");
+        let dir = get_exe_dir().join("sounds");
         let _ = std::fs::create_dir_all(&dir);
         let destination_path = dir.join(&safe_filename);
         let dest_str = destination_path.display().to_string();
@@ -592,7 +641,7 @@ impl SoundpadApp {
                                 .collect();
                             let safe_filename = if safe_filename.is_empty() { "tuna_sound.mp3".to_string() } else { safe_filename };
 
-                            let dir = get_exe_dir().join("downloaded_sounds");
+                            let dir = get_exe_dir().join("sounds");
                             let _ = std::fs::create_dir_all(&dir);
                             let destination_path = dir.join(&safe_filename);
                             let dest_str = destination_path.display().to_string();
@@ -822,6 +871,11 @@ impl eframe::App for SoundpadApp {
             }
         }
 
+        while let Ok(tag) = self.update_rx.try_recv() {
+            self.update_available = Some(tag.clone());
+            self.log_info(&format!("New version found on GitHub! Version: {}", tag));
+        }
+
         egui::TopBottomPanel::top("top_menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -985,6 +1039,18 @@ impl eframe::App for SoundpadApp {
                     ui.label(format!("Queue: {} item(s)", self.download_queue.len()));
                 }
 
+                if let Some(ref tag) = self.update_available {
+                    ui.separator();
+                    let btn_text = format!("⚡ Update Available: {} - View Release", tag);
+                    let btn = ui.button(egui::RichText::new(btn_text).color(egui::Color32::LIGHT_GREEN));
+                    if btn.clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(format!(
+                            "https://github.com/makcnmflow/klwp-spad/releases/tag/{}",
+                            tag
+                        )));
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(format!("{} GitHub", regular::GITHUB_LOGO)).on_hover_text("Open GitHub Repository").clicked() {
                         ctx.open_url(egui::OpenUrl::new_tab("https://github.com/makcnmflow/klwp-spad"));
@@ -1116,26 +1182,35 @@ impl eframe::App for SoundpadApp {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     if ui.button(format!("{} Add sound to list...", regular::PLUS)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Audio Files (*.mp3, *.wav)", &["mp3", "wav"])
-                            .pick_file()
+                        if let Some(path) = rfd::FileDialog::new().pick_file()
                         {
                             let title = path.file_stem()
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "Unnamed".to_string());
 
-                            let duration = get_duration_str(&path);
+                            let mut final_path = path.clone();
+                            let mut duration = get_duration_str(&final_path);
+
+                            if duration == "0:00" {
+                                if let Some(converted) = try_convert_with_ffmpeg(&final_path.display().to_string()) {
+                                    final_path = std::path::PathBuf::from(&converted);
+                                    duration = get_duration_str(&final_path);
+                                    self.log_info(&format!("Converted '{}' to WAV via ffmpeg", title));
+                                } else {
+                                    self.log_warn(&format!("'{}' format not supported by rodio or ffmpeg", title));
+                                }
+                            }
 
                             if self.selected_category_idx < self.config.categories.len() {
                                 self.config.categories[self.selected_category_idx].sounds.push(SoundConfig {
                                     title: title.clone(),
-                                    path: path.display().to_string(),
+                                    path: final_path.display().to_string(),
                                     duration,
                                     hotkey: None,
                                     play_count: 0,
                                 });
                                 self.save_app_config();
-                                self.log_info(&format!("Imported local audio file: '{}'", title));
+                                self.log_info(&format!("Imported: '{}'", title));
                             }
                         }
                     }
@@ -1200,7 +1275,18 @@ impl eframe::App for SoundpadApp {
                                 }
 
                                 if let Some(idx) = to_remove {
-                                    let title = self.config.categories[self.selected_category_idx].sounds[idx].title.clone();
+                                    let sound = &self.config.categories[self.selected_category_idx].sounds[idx];
+                                    let title = sound.title.clone();
+                                    let sound_path = sound.path.clone();
+
+                                    let dl_dir = get_exe_dir().join("sounds");
+                                    let dl_dir_str = dl_dir.display().to_string().replace('\\', "/");
+                                    let path_str = sound_path.replace('\\', "/");
+                                    if path_str.starts_with(&dl_dir_str) {
+                                        let _ = std::fs::remove_file(&sound_path);
+                                        self.log_info(&format!("Deleted downloaded file: '{}'", sound_path));
+                                    }
+
                                     self.log_info(&format!("Removed audio file from playlist: '{}'", title));
                                     self.config.categories[self.selected_category_idx].sounds.remove(idx);
                                     self.selected_sound_idx = None;
@@ -1454,6 +1540,15 @@ impl eframe::App for SoundpadApp {
                                 ui.add_space(5.0);
                                 ui.small("A simple Soundpad clone made with Rust.");
                                 ui.small("I made this like in one day XD");
+
+                                ui.add_space(15.0);
+                                let version = env!("APP_VERSION");
+                                let ver_str = if version.starts_with('1') || version.starts_with('2') || version.starts_with('0') {
+                                    format!("v{}", version)
+                                } else {
+                                    version.to_string()
+                                };
+                                ui.label(egui::RichText::new(ver_str).monospace().color(egui::Color32::GRAY));
                             });
                         }
                     }
