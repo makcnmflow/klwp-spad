@@ -8,7 +8,7 @@
 
 ### this app supports soundpad:// and voicemod:// calls so you can use websites with one click to add buttons and they will work!!!
 working websites:
-https://tuna.voicemod.net/sounds/
+https://tuna.voicemod.net/sounds/ ,
 https://uwupad.me/
 if you have more working websites send them to issues i will add them here!!
 
