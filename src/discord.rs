@@ -38,6 +38,14 @@ pub fn spawn_discord_rpc_thread() -> std::sync::mpsc::Sender<DiscordMsg> {
                 continue;
             }
 
+            if !connected {
+                if let Some(ref mut c) = client {
+                    if c.connect().is_ok() {
+                        connected = true;
+                    }
+                }
+            }
+
             if connected {
                 if let Some(ref mut c) = client {
                     match msg {
