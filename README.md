@@ -2,6 +2,8 @@
 
 # klwp-spad
 
+## (killwinparty soundpad)
+
 ## very cool copy of soundpad for free by me klwp
 
 # TO WORK PROPORLY YOU NEED TO INSTALL https://vb-audio.com/Cable/ (VIRTUAL CABLE)
