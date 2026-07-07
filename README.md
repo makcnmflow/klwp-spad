@@ -1,6 +1,6 @@
 <img width="100" height="100" alt="klwpspaico" src="https://github.com/user-attachments/assets/e16056b3-495b-42bb-a040-7411d6f944d3" />
 
-# klwp-spad
+# klwp spad
 
 ## (killwinparty soundpad)
 
