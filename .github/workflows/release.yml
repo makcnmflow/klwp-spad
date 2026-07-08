@@ -51,14 +51,25 @@ jobs:
               "IS_PRERELEASE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
 
-          $tag_message = (git tag -l --format="%(contents)" $tag).Trim()
+          $tag_type = git cat-file -t $tag
+          if ($tag_type -eq "tag") {
+              $tag_message = (git tag -l --format="%(contents)" $tag).Trim()
+          } else {
+              $tag_message = ""
+          }
 
           if (![string]::IsNullOrEmpty($tag_message)) {
               $tag_message | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
           } elseif (Test-Path ./release_notes.txt) {
               Copy-Item -Path ./release_notes.txt -Destination ./RELEASE_BODY.md
           } else {
-              "Automated build and deploy for version $tag." | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
+              $prev_tag = git describe --tags --abbrev=0 $tag^ 2>$null
+              $changelog = if ($prev_tag) { git log $prev_tag..$tag --oneline --no-decorate } else { $null }
+              if ($changelog) {
+                  $changelog | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
+              } else {
+                  "Automated build and deploy for version $tag." | Out-File -FilePath ./RELEASE_BODY.md -Encoding utf8
+              }
           }
 
       - name: Download ffmpeg

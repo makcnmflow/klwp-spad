@@ -68,6 +68,25 @@ pub fn load_decoder_stream(
     Ok(Box::new(resampled))
 }
 
+pub fn find_virtual_cable_output_name(output_devices: &[String]) -> String {
+    for dev in output_devices {
+        let name = dev.to_lowercase();
+        if name.contains("cable") || name.contains("vb-audio") {
+            return dev.clone();
+        }
+    }
+    String::new()
+}
+
+pub fn find_any_virtual_cable_output(host: &cpal::Host) -> Option<cpal::Device> {
+    host.output_devices().ok()?.find(|d| {
+        d.name().ok().map(|n| {
+            let n = n.to_lowercase();
+            n.contains("cable") || n.contains("vb-audio")
+        }).unwrap_or(false)
+    })
+}
+
 pub fn start_audio_streams(
     host: &cpal::Host,
     input_device_name: &str,
@@ -80,9 +99,16 @@ pub fn start_audio_streams(
         .find(|d| d.name().map(|n| n == input_device_name).unwrap_or(false))
         .ok_or("Microphone not found. Please select an active device in settings.")?;
 
+    let cable_lower = cable_device_name.to_lowercase();
     let output_device = host
         .output_devices()?
-        .find(|d| d.name().map(|n| n == cable_device_name).unwrap_or(false))
+        .find(|d| {
+            d.name().ok().map(|name| {
+                let n_lower = name.to_lowercase();
+                !cable_lower.is_empty() && (n_lower == cable_lower || n_lower.contains(&cable_lower))
+            }).unwrap_or(false)
+        })
+        .or_else(|| find_any_virtual_cable_output(host))
         .ok_or("Virtual cable not found. Please specify a valid cable in settings.")?;
 
     let input_config = input_device.default_input_config()?;

@@ -74,7 +74,7 @@ fn main() -> eframe::Result<()> {
             };
 
             eframe::run_native(
-                "klwp-spad",
+                "klwp spad",
                 options,
                 Box::new(move |cc| {
                     let mut fonts = egui::FontDefinitions::default();

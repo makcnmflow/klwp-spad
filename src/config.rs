@@ -79,10 +79,23 @@ impl Default for AppConfig {
             .and_then(|d| d.name().ok())
             .unwrap_or_default();
 
+        let cable_output = host
+            .output_devices()
+            .map(|devices| {
+                devices
+                    .filter_map(|d| d.name().ok())
+                    .find(|name| {
+                        let n = name.to_lowercase();
+                        n.contains("cable") || n.contains("vb-audio")
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
         Self {
             is_first_run: true,
             selected_input: default_input,
-            selected_output: String::new(),
+            selected_output: cable_output,
             selected_monitoring: default_output,
             volume_mic: 0.8,
             volume_headphones: 0.5,

@@ -1,6 +1,6 @@
 use crate::audio::{
-    get_duration_seconds, get_duration_str, load_decoder_stream, start_audio_streams,
-    ActiveSound, AudioState, find_virtual_cable_microphone,
+    find_virtual_cable_microphone, find_virtual_cable_output_name, get_duration_seconds,
+    get_duration_str, load_decoder_stream, start_audio_streams, ActiveSound, AudioState,
 };
 use crate::config::{get_exe_dir, load_config, save_config, AppConfig, CategoryConfig, SoundConfig};
 use crate::discord::{spawn_discord_rpc_thread, DiscordMsg};
@@ -66,6 +66,7 @@ pub struct SoundpadApp {
     pub hotkey_manager: GlobalHotKeyManager,
     pub registered_hotkeys: Vec<HotKey>,
     pub recording_state: Option<RecordingState>,
+    pub hotkey_options_idx: Option<usize>,
     pub url_queue: Arc<Mutex<Vec<String>>>,
     pub new_sounds_rx: std::sync::mpsc::Receiver<DownloadResult>,
     pub new_sounds_tx: std::sync::mpsc::Sender<DownloadResult>,
@@ -203,6 +204,7 @@ impl SoundpadApp {
             hotkey_manager,
             registered_hotkeys,
             recording_state: None,
+            hotkey_options_idx: None,
             url_queue,
             new_sounds_rx,
             new_sounds_tx,
@@ -297,6 +299,18 @@ impl SoundpadApp {
         self.monitoring_stream = None;
 
         let host = cpal::default_host();
+
+        if self.config.selected_output.is_empty() {
+            let devices: Vec<String> = host
+                .output_devices()
+                .map(|d| d.filter_map(|d| d.name().ok()).collect())
+                .unwrap_or_default();
+            let auto = find_virtual_cable_output_name(&devices);
+            if !auto.is_empty() {
+                self.config.selected_output = auto;
+            }
+        }
+
         match start_audio_streams(
             &host,
             &self.config.selected_input,
@@ -1261,10 +1275,14 @@ impl eframe::App for SoundpadApp {
                                     };
 
                                     if ui.button(hk_text).clicked() {
-                                        self.recording_state = Some(RecordingState {
-                                            sound_idx: idx,
-                                            recorded_combination: None,
-                                        });
+                                        if sound_hotkey_opt.is_some() {
+                                            self.hotkey_options_idx = Some(idx);
+                                        } else {
+                                            self.recording_state = Some(RecordingState {
+                                                sound_idx: idx,
+                                                recorded_combination: None,
+                                            });
+                                        }
                                     }
 
                                     if ui.button(regular::TRASH).clicked() {
@@ -1356,6 +1374,64 @@ impl eframe::App for SoundpadApp {
             self.save_app_config();
             self.update_global_hotkeys();
             self.log_info(&format!("Assigned shortcut combination '{}' to index #{}", combo, sound_idx_to_save + 1));
+        }
+
+        let mut should_close_hk_options = false;
+        let mut should_change_hk = false;
+        let mut should_remove_hk = false;
+        let mut hk_option_idx = 0;
+
+        if let Some(idx) = self.hotkey_options_idx {
+            hk_option_idx = idx;
+            let current_hk = self.config.categories[self.selected_category_idx].sounds[idx].hotkey.clone();
+
+            egui::Window::new("Hotkey Options")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(280.0);
+                    ui.heading("Hotkey");
+                    ui.add_space(10.0);
+
+                    if let Some(hk) = &current_hk {
+                        ui.label(format!("Current hotkey: {}", hk));
+                    }
+                    ui.add_space(15.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Change Hotkey").clicked() {
+                            should_change_hk = true;
+                            should_close_hk_options = true;
+                        }
+                        if ui.button("Remove Hotkey").clicked() {
+                            should_remove_hk = true;
+                            should_close_hk_options = true;
+                        }
+                    });
+                    ui.add_space(10.0);
+                    if ui.button("Close").clicked() {
+                        should_close_hk_options = true;
+                    }
+                });
+        }
+
+        if should_close_hk_options {
+            self.hotkey_options_idx = None;
+        }
+
+        if should_change_hk {
+            self.recording_state = Some(RecordingState {
+                sound_idx: hk_option_idx,
+                recorded_combination: None,
+            });
+        }
+
+        if should_remove_hk {
+            self.config.categories[self.selected_category_idx].sounds[hk_option_idx].hotkey = None;
+            self.save_app_config();
+            self.update_global_hotkeys();
+            self.log_info(&format!("Removed hotkey from index #{}", hk_option_idx + 1));
         }
 
         if self.show_settings {
@@ -1560,6 +1636,19 @@ impl eframe::App for SoundpadApp {
                         if ui.button(button_text).clicked() {
                             self.config.is_first_run = false;
                             self.show_settings = false;
+
+                            if self.config.selected_output.is_empty() {
+                                let host = cpal::default_host();
+                                let devices: Vec<String> = host
+                                    .output_devices()
+                                    .map(|d| d.filter_map(|d| d.name().ok()).collect())
+                                    .unwrap_or_default();
+                                let auto = find_virtual_cable_output_name(&devices);
+                                if !auto.is_empty() {
+                                    self.config.selected_output = auto;
+                                }
+                            }
+
                             self.save_app_config();
 
                             self.start_streaming();
