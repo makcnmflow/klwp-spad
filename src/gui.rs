@@ -14,12 +14,26 @@ use eframe::egui;
 use egui_phosphor::regular;
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager};
 use ringbuf::HeapRb;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use threadpool::ThreadPool;
 
-#[derive(PartialEq)]
+const AVAILABLE_ICONS: &[&str] = &[
+    "📁", "🏠", "🎮", "🎵", "🔥", "😂", "👑", "🎙", "📢", "👾", "👽", "🐱", "🐶", "🍕", "🎬", "✨"
+];
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum SortColumn {
+    Number,
+    Title,
+    Duration,
+}
+
+#[derive(Clone, PartialEq)]
 pub enum SettingsTab {
     Devices,
     Hotkeys,
+    Audio,
     Appearance,
     Categories,
     About,
@@ -73,9 +87,16 @@ pub struct SoundpadApp {
     pub download_queue: Vec<QueuedDownload>,
     pub current_download: Option<QueuedDownload>,
     pub download_progress: f32,
+    pub download_progress_shared: Option<Arc<Mutex<f32>>>,
     pub discord_tx: std::sync::mpsc::Sender<DiscordMsg>,
     pub update_rx: std::sync::mpsc::Receiver<String>,
     pub update_available: Option<String>,
+    pub decoder_pool: ThreadPool,
+    pub sound_rename_cmd: Option<(usize, String)>,
+    pub sort_column: Option<SortColumn>,
+    pub sort_ascending: bool,
+    pub sorted_indices: Vec<usize>,
+    pub pending_apply: bool,
 }
 
 impl SoundpadApp {
@@ -103,7 +124,11 @@ impl SoundpadApp {
             .unwrap_or_default();
 
         let mut monitoring_devices = vec!["[Disabled]".to_string()];
-        monitoring_devices.extend(output_devices.clone());
+        for dev in &output_devices {
+            if !monitoring_devices.contains(dev) {
+                monitoring_devices.push(dev.clone());
+            }
+        }
 
         let show_settings = config.is_first_run;
 
@@ -141,39 +166,26 @@ impl SoundpadApp {
         let update_tx_clone = update_tx.clone();
 
         std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new("curl");
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000);
-            }
-            let output = cmd
-                .args(&[
-                    "-s",
-                    "-L",
-                    "-H", "Accept: application/vnd.github+json",
-                    "-A", "Mozilla/5.0",
-                    "https://api.github.com/repos/makcnmflow/klwp-spad/releases/latest"
-                ])
-                .output();
+            let client = reqwest::blocking::Client::new();
+            let resp = client
+                .get("https://api.github.com/repos/makcnmflow/klwp-spad/releases/latest")
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "klwp-spad")
+                .send();
 
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let json_str = String::from_utf8_lossy(&out.stdout);
+            if let Ok(response) = resp {
+                if response.status().is_success() {
+                    let json_str = response.text().unwrap_or_default();
                     
                     #[derive(serde::Deserialize)]
                     struct GitHubRelease {
                         tag_name: String,
                     }
 
-                    fn strip_ver_prefix(s: &str) -> &str {
-                        s.trim_start_matches(|c: char| c.is_alphabetic())
-                    }
-
                     if let Ok(release) = serde_json::from_str::<GitHubRelease>(&json_str) {
-                        let current_ver = strip_ver_prefix(env!("APP_VERSION"));
-                        let latest_tag = strip_ver_prefix(&release.tag_name);
-                        if latest_tag != current_ver {
+                        let current_ver = env!("APP_VERSION");
+                        let latest_tag = &release.tag_name;
+                        if is_newer_version(current_ver, latest_tag) {
                             let _ = update_tx_clone.send(release.tag_name);
                         }
                     }
@@ -211,12 +223,21 @@ impl SoundpadApp {
             download_queue: Vec::new(),
             current_download: None,
             download_progress: 0.0,
+            download_progress_shared: None,
             discord_tx,
             update_rx,
             update_available: None,
+            decoder_pool: ThreadPool::new(2),
+            sound_rename_cmd: None,
+            sort_column: None,
+            sort_ascending: true,
+            sorted_indices: Vec::new(),
+            pending_apply: false,
         };
 
         app.log_info("System initialized successfully.");
+
+        app.update_sorted_indices();
 
         let _ = app.discord_tx.send(DiscordMsg::UpdateStatus {
             enabled: app.config.enable_discord_rpc,
@@ -341,23 +362,34 @@ impl SoundpadApp {
     fn play_sound_at_index_with_offset(&mut self, idx: usize, start_seconds: Option<f32>) {
         if self.selected_category_idx >= self.config.categories.len() { return; }
 
-        self.config.categories[self.selected_category_idx].sounds[idx].play_count += 1;
-        self.save_app_config();
-
-        let category = &self.config.categories[self.selected_category_idx];
-        if idx >= category.sounds.len() || self.output_stream.is_none() {
-            return;
+        {
+            let cat = &mut self.config.categories[self.selected_category_idx];
+            if idx >= cat.sounds.len() { return; }
+            cat.sounds[idx].play_count += 1;
         }
 
-        let path = category.sounds[idx].path.clone();
-        let title = category.sounds[idx].title.clone();
+        if self.output_stream.is_none() {
+            self.start_streaming();
+            if self.output_stream.is_none() {
+                return;
+            }
+        }
+
+        let path = self.config.categories[self.selected_category_idx].sounds[idx].path.clone();
+        let title = self.config.categories[self.selected_category_idx].sounds[idx].title.clone();
 
         self.log_info(&format!("Playing sound (streaming): '{}'", title));
 
         let rate_mic = self.output_sample_rate;
         let rate_head = self.monitoring_sample_rate;
 
-        let duration_secs = get_duration_seconds(&path);
+        let duration_secs = if self.config.categories[self.selected_category_idx].sounds[idx].duration_secs > 0.0 {
+            self.config.categories[self.selected_category_idx].sounds[idx].duration_secs
+        } else {
+            let secs = get_duration_seconds(&path);
+            self.config.categories[self.selected_category_idx].sounds[idx].duration_secs = secs;
+            secs
+        };
         let total_samples = (duration_secs * rate_mic as f32) as usize;
 
         let rb_mic = HeapRb::<f32>::new(32768);
@@ -366,14 +398,14 @@ impl SoundpadApp {
         let rb_head = HeapRb::<f32>::new(32768);
         let (mut prod_head, cons_head) = rb_head.split();
 
-        let stop_signal = Arc::new(Mutex::new(false));
+        let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_signal_clone = Arc::clone(&stop_signal);
 
-        let finished_decoding = Arc::new(Mutex::new(false));
+        let finished_decoding = Arc::new(AtomicBool::new(false));
         let finished_decoding_clone = Arc::clone(&finished_decoding);
 
         let path_clone = path.clone();
-        std::thread::spawn(move || {
+        self.decoder_pool.execute(move || {
             let source_mic = match load_decoder_stream(&path_clone, rate_mic) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -397,7 +429,7 @@ impl SoundpadApp {
             let mut head_done = false;
 
             while !mic_done || !head_done {
-                if *stop_signal_clone.lock().unwrap() {
+                if stop_signal_clone.load(Ordering::Relaxed) {
                     break;
                 }
 
@@ -438,9 +470,7 @@ impl SoundpadApp {
                 }
             }
 
-            if let Ok(mut finished) = finished_decoding_clone.lock() {
-                *finished = true;
-            }
+            finished_decoding_clone.store(true, Ordering::Relaxed);
         });
 
         let mut state = self.audio_state.lock().unwrap();
@@ -454,9 +484,7 @@ impl SoundpadApp {
         state.sample_rate = rate_mic;
 
         if let Some(ref old_sound) = state.active_sound {
-            if let Ok(mut sig) = old_sound.stop_signal.lock() {
-                *sig = true;
-            }
+            old_sound.stop_signal.store(true, Ordering::Relaxed);
         }
 
         state.active_sound = Some(ActiveSound {
@@ -471,9 +499,7 @@ impl SoundpadApp {
         {
             let mut state = self.audio_state.lock().unwrap();
             if let Some(ref sound) = state.active_sound {
-                if let Ok(mut sig) = sound.stop_signal.lock() {
-                    *sig = true;
-                }
+                sound.stop_signal.store(true, Ordering::Relaxed);
             }
             state.active_sound = None;
             state.is_paused = false;
@@ -490,6 +516,35 @@ impl SoundpadApp {
             state.is_paused
         };
         self.log_info(if is_paused { "Playback paused." } else { "Playback resumed." });
+    }
+
+    fn update_sorted_indices(&mut self) {
+        if self.selected_category_idx >= self.config.categories.len() { return; }
+        let cat = &self.config.categories[self.selected_category_idx];
+        let n = cat.sounds.len();
+        let mut indices: Vec<usize> = (0..n).collect();
+        if let Some(ref col) = self.sort_column {
+            match col {
+                SortColumn::Number => {
+                    if !self.sort_ascending {
+                        indices.reverse();
+                    }
+                }
+                SortColumn::Title => {
+                    indices.sort_by(|&a, &b| {
+                        let cmp = cat.sounds[a].title.to_lowercase().cmp(&cat.sounds[b].title.to_lowercase());
+                        if self.sort_ascending { cmp } else { cmp.reverse() }
+                    });
+                }
+                SortColumn::Duration => {
+                    indices.sort_by(|&a, &b| {
+                        let cmp = cat.sounds[a].duration_secs.partial_cmp(&cat.sounds[b].duration_secs).unwrap_or(std::cmp::Ordering::Equal);
+                        if self.sort_ascending { cmp } else { cmp.reverse() }
+                    });
+                }
+            }
+        }
+        self.sorted_indices = indices;
     }
 
     fn download_and_add_sound(&mut self, url: String) {
@@ -513,14 +568,16 @@ impl SoundpadApp {
     }
 
     fn start_queued_download(&mut self, dl: QueuedDownload) {
+        let shared = Arc::new(Mutex::new(0.0f32));
+        self.download_progress_shared = Some(shared.clone());
         if dl.is_voicemod {
-            self.trigger_voicemod_download(dl.url, dl.category_idx);
+            self.trigger_voicemod_download(dl.url, dl.category_idx, shared);
         } else {
-            self.trigger_soundpad_download(dl.url, dl.category_idx);
+            self.trigger_soundpad_download(dl.url, dl.category_idx, shared);
         }
     }
 
-    fn trigger_soundpad_download(&mut self, url: String, category_idx: usize) {
+    fn trigger_soundpad_download(&mut self, url: String, category_idx: usize, progress_shared: Arc<Mutex<f32>>) {
         self.status_message = "Downloading audio...".to_string();
         self.log_info(&format!("Starting background download: {}", url));
 
@@ -545,25 +602,48 @@ impl SoundpadApp {
         let url_clone = url.clone();
 
         std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new("curl");
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000);
-            }
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+                .unwrap();
 
-            let output = cmd
-                .args(&[
-                    "-L",
-                    "-k",
-                    "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "-o", &dest_str,
-                    &url_clone
-                ])
-                .output();
+            let result = client.get(&url_clone).send();
+            match result {
+                Ok(response) if response.status().is_success() => {
+                    let total_size = response.content_length().unwrap_or(0);
+                    let mut downloaded: u64 = 0;
+                    let mut all_bytes = Vec::new();
 
-            match output {
-                Ok(out) if out.status.success() => {
+                    if total_size > 0 {
+                        let mut buf = vec![0u8; 65536];
+                        use std::io::Read;
+                        let mut reader = response;
+                        loop {
+                            let n = match reader.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            all_bytes.extend_from_slice(&buf[..n]);
+                            downloaded += n as u64;
+                            if let Ok(mut p) = progress_shared.lock() {
+                                *p = downloaded as f32 / total_size as f32;
+                            }
+                        }
+                    } else {
+                        match response.bytes() {
+                            Ok(b) => all_bytes = b.to_vec(),
+                            Err(e) => {
+                                let _ = tx.send(DownloadResult::Error(format!("Failed to read response body: {}", e)));
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = std::fs::write(&dest_str, &all_bytes) {
+                        let _ = tx.send(DownloadResult::Error(format!("Failed to save file: {}", e)));
+                        return;
+                    }
                     let path_obj = std::path::Path::new(&dest_str);
                     let duration = get_duration_str(path_obj);
                     let title = path_obj.file_stem()
@@ -576,27 +656,22 @@ impl SoundpadApp {
                         duration,
                         hotkey: None,
                         play_count: 0,
+                        duration_secs: 0.0,
                     };
 
                     let _ = tx.send(DownloadResult::Success { sound: new_sound, category_idx });
                 }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                    let err_msg = if stderr.is_empty() {
-                        format!("Curl process returned exit code: {}", out.status)
-                    } else {
-                        stderr
-                    };
-                    let _ = tx.send(DownloadResult::Error(err_msg));
+                Ok(response) => {
+                    let _ = tx.send(DownloadResult::Error(format!("Download request failed with status: {}", response.status())));
                 }
                 Err(e) => {
-                    let _ = tx.send(DownloadResult::Error(format!("Could not execute curl: {}", e)));
+                    let _ = tx.send(DownloadResult::Error(format!("Network request failed: {}", e)));
                 }
             }
         });
     }
 
-    fn trigger_voicemod_download(&mut self, uuid: String, category_idx: usize) {
+    fn trigger_voicemod_download(&mut self, uuid: String, category_idx: usize, progress_shared: Arc<Mutex<f32>>) {
         self.status_message = "Locating download link on Voicemod Tuna...".to_string();
         self.log_info(&format!("Scraping Voicemod Tuna for UUID: {}", uuid));
 
@@ -604,116 +679,121 @@ impl SoundpadApp {
 
         std::thread::spawn(move || {
             let sound_page_url = format!("https://tuna.voicemod.net/sound/{}", uuid);
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+                .unwrap();
 
-            let mut cmd1 = std::process::Command::new("curl");
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd1.creation_flags(0x08000000);
-            }
-
-            let output = cmd1
-                .args(&[
-                    "-L",
-                    "-k",
-                    "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    &sound_page_url
-                ])
-                .output();
-
-            match output {
-                Ok(out) if out.status.success() => {
-                    let html = String::from_utf8_lossy(&out.stdout);
-
-                    let title = if let Some(start_pos) = html.find("<title>") {
-                        let sub = &html[start_pos + 7..];
-                        if let Some(end_pos) = sub.find("</title>") {
-                            let raw_title = &sub[..end_pos];
-                            let clean = if let Some(pos) = raw_title.find("Meme") {
-                                raw_title[..pos].trim().to_string()
-                            } else if let Some(pos) = raw_title.to_lowercase().find("meme") {
-                                raw_title[..pos].trim().to_string()
-                            } else {
-                                raw_title.trim().to_string()
-                            };
-                            if !clean.is_empty() { clean } else { "Downloaded Tuna Meme".to_string() }
-                        } else {
-                            "Downloaded Tuna Meme".to_string()
-                        }
-                    } else {
-                        "Downloaded Tuna Meme".to_string()
-                    };
-
-                    if let Some(pos) = html.find("\"contentUrl\":\"") {
-                        let sub = &html[pos + 14..];
-                        if let Some(end_pos) = sub.find("\"") {
-                            let download_url = &sub[..end_pos];
-
-                            let filename = download_url.split('/').last().unwrap_or("sound.mp3");
-                            let safe_filename: String = filename.chars()
-                                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_' || *c == ' ')
-                                .collect();
-                            let safe_filename = if safe_filename.is_empty() { "tuna_sound.mp3".to_string() } else { safe_filename };
-
-                            let dir = get_exe_dir().join("sounds");
-                            let _ = std::fs::create_dir_all(&dir);
-                            let destination_path = dir.join(&safe_filename);
-                            let dest_str = destination_path.display().to_string();
-
-                            let mut cmd2 = std::process::Command::new("curl");
-                            #[cfg(target_os = "windows")]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                cmd2.creation_flags(0x08000000);
-                            }
-
-                            let curl_download = cmd2
-                                .args(&[
-                                    "-L",
-                                    "-k",
-                                    "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                    "-o", &dest_str,
-                                    download_url
-                                ])
-                                .output();
-
-                            match curl_download {
-                                Ok(down_out) if down_out.status.success() => {
-                                    let path_obj = std::path::Path::new(&dest_str);
-                                    let duration = get_duration_str(path_obj);
-
-                                    let new_sound = SoundConfig {
-                                        title,
-                                        path: dest_str,
-                                        duration,
-                                        hotkey: None,
-                                        play_count: 0,
-                                    };
-
-                                    let _ = tx.send(DownloadResult::Success { sound: new_sound, category_idx });
-                                }
-                                Ok(down_out) => {
-                                    let stderr = String::from_utf8_lossy(&down_out.stderr).to_string();
-                                    let err_msg = if stderr.is_empty() {
-                                        format!("Download connection aborted with status: {}", down_out.status)
-                                    } else {
-                                        stderr
-                                    };
-                                    let _ = tx.send(DownloadResult::Error(err_msg));
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(DownloadResult::Error(format!("Failed to execute download request: {}", e)));
-                                }
-                            }
-                        } else {
-                            let _ = tx.send(DownloadResult::Error("Tuna service did not provide a valid contentUrl".to_string()));
-                        }
-                    } else {
-                        let _ = tx.send(DownloadResult::Error("Failed to scrape direct download URL from Tuna webpage".to_string()));
-                    }
-                }
+            let page_result = client.get(&sound_page_url).send();
+            let html = match page_result {
+                Ok(resp) if resp.status().is_success() => resp.text().unwrap_or_default(),
                 _ => {
                     let _ = tx.send(DownloadResult::Error("Connection failed while querying Voicemod Tuna database".to_string()));
+                    return;
+                }
+            };
+
+            let title = if let Some(start_pos) = html.find("<title>") {
+                let sub = &html[start_pos + 7..];
+                if let Some(end_pos) = sub.find("</title>") {
+                    let raw_title = &sub[..end_pos];
+                    let clean = if let Some(pos) = raw_title.find("Meme") {
+                        raw_title[..pos].trim().to_string()
+                    } else if let Some(pos) = raw_title.to_lowercase().find("meme") {
+                        raw_title[..pos].trim().to_string()
+                    } else {
+                        raw_title.trim().to_string()
+                    };
+                    if !clean.is_empty() { clean } else { "Downloaded Tuna Meme".to_string() }
+                } else {
+                    "Downloaded Tuna Meme".to_string()
+                }
+            } else {
+                "Downloaded Tuna Meme".to_string()
+            };
+
+            let download_url = if let Some(pos) = html.find("\"contentUrl\":\"") {
+                let sub = &html[pos + 14..];
+                sub.find("\"").map(|end_pos| &sub[..end_pos])
+            } else {
+                None
+            };
+
+            let download_url = match download_url {
+                Some(url) => url.to_string(),
+                None => {
+                    let _ = tx.send(DownloadResult::Error("Failed to scrape direct download URL from Tuna webpage".to_string()));
+                    return;
+                }
+            };
+
+            let filename = download_url.split('/').last().unwrap_or("sound.mp3");
+            let safe_filename: String = filename.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_' || *c == ' ')
+                .collect();
+            let safe_filename = if safe_filename.is_empty() { "tuna_sound.mp3".to_string() } else { safe_filename };
+
+            let dir = get_exe_dir().join("sounds");
+            let _ = std::fs::create_dir_all(&dir);
+            let destination_path = dir.join(&safe_filename);
+            let dest_str = destination_path.display().to_string();
+
+            let download_result = client.get(&download_url).send();
+            match download_result {
+                Ok(resp) if resp.status().is_success() => {
+                    let total_size = resp.content_length().unwrap_or(0);
+                    let mut downloaded: u64 = 0;
+                    let mut all_bytes = Vec::new();
+
+                    if total_size > 0 {
+                        let mut buf = vec![0u8; 65536];
+                        use std::io::Read;
+                        let mut reader = resp;
+                        loop {
+                            let n = match reader.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            all_bytes.extend_from_slice(&buf[..n]);
+                            downloaded += n as u64;
+                            if let Ok(mut p) = progress_shared.lock() {
+                                *p = downloaded as f32 / total_size as f32;
+                            }
+                        }
+                    } else {
+                        match resp.bytes() {
+                            Ok(b) => all_bytes = b.to_vec(),
+                            Err(e) => {
+                                let _ = tx.send(DownloadResult::Error(format!("Failed to read response body: {}", e)));
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = std::fs::write(&dest_str, &all_bytes) {
+                        let _ = tx.send(DownloadResult::Error(format!("Failed to save file: {}", e)));
+                        return;
+                    }
+                    let path_obj = std::path::Path::new(&dest_str);
+                    let duration = get_duration_str(path_obj);
+
+                    let new_sound = SoundConfig {
+                        title,
+                        path: dest_str,
+                        duration,
+                        hotkey: None,
+                        play_count: 0,
+                        duration_secs: 0.0,
+                    };
+
+                    let _ = tx.send(DownloadResult::Success { sound: new_sound, category_idx });
+                }
+                Ok(resp) => {
+                    let _ = tx.send(DownloadResult::Error(format!("Download connection aborted with status: {}", resp.status())));
+                }
+                Err(e) => {
+                    let _ = tx.send(DownloadResult::Error(format!("Failed to execute download request: {}", e)));
                 }
             }
         });
@@ -722,6 +802,7 @@ impl SoundpadApp {
 
 impl Drop for SoundpadApp {
     fn drop(&mut self) {
+        self.save_app_config();
         if !self.config.selected_input.is_empty() {
             set_default_windows_microphone(&self.config.selected_input);
         }
@@ -730,22 +811,15 @@ impl Drop for SoundpadApp {
 
 impl eframe::App for SoundpadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(mut state) = self.audio_state.lock() {
-            state.volume_mic = self.config.volume_mic;
-            state.volume_headphones = self.config.volume_headphones;
-            state.volume_physical_mic = self.config.volume_physical_mic;
-            state.mute_mic_during_playback = self.config.mute_mic_during_playback;
-        }
-
         let sound_finished = {
-            if let Ok(state) = self.audio_state.lock() {
+            if let Ok(mut state) = self.audio_state.lock() {
+                state.volume_mic = self.config.volume_mic;
+                state.volume_headphones = self.config.volume_headphones;
+                state.volume_physical_mic = self.config.volume_physical_mic;
+                state.mute_mic_during_playback = self.config.mute_mic_during_playback;
+
                 if let Some(ref sound) = state.active_sound {
-                    let finished_decoding = if let Ok(finished) = sound.finished_decoding.lock() {
-                        *finished
-                    } else {
-                        false
-                    };
-                    finished_decoding && sound.consumer_mic.is_empty()
+                    sound.finished_decoding.load(Ordering::Relaxed) && sound.consumer_mic.is_empty()
                 } else {
                     false
                 }
@@ -828,10 +902,16 @@ impl eframe::App for SoundpadApp {
         if let Some(raw_url) = next_url {
             if raw_url.starts_with("soundpad://") {
                 if let Some(http_url) = parse_soundpad_protocol(&raw_url) {
+                    if self.config.focus_on_sound_link {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     self.download_and_add_sound(http_url);
                 }
             } else if raw_url.starts_with("voicemod:") {
                 if let Some(uuid) = parse_voicemod_protocol(&raw_url) {
+                    if self.config.focus_on_sound_link {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     self.download_and_add_voicemod_sound(uuid);
                 }
             }
@@ -845,7 +925,11 @@ impl eframe::App for SoundpadApp {
         }
 
         if self.current_download.is_some() {
-            self.download_progress = (self.download_progress + 0.005).min(0.95);
+            if let Some(ref shared) = self.download_progress_shared {
+                if let Ok(p) = shared.lock() {
+                    self.download_progress = *p;
+                }
+            }
         }
 
         while let Ok(result) = self.new_sounds_rx.try_recv() {
@@ -856,11 +940,15 @@ impl eframe::App for SoundpadApp {
                         self.config.categories[category_idx].sounds.push(sound);
                         self.save_app_config();
                         self.update_global_hotkeys();
+                        if category_idx == self.selected_category_idx {
+                            self.update_sorted_indices();
+                        }
                         self.status_message = format!("Added '{}' successfully!", name);
                         self.log_info(&format!("Imported sound file '{}' added to category #{}", name, category_idx + 1));
                     }
                     self.current_download = None;
                     self.download_progress = 0.0;
+                    self.download_progress_shared = None;
                 }
                 DownloadResult::Error(err_msg) => {
                     if let Some(mut active) = self.current_download.clone() {
@@ -876,6 +964,7 @@ impl eframe::App for SoundpadApp {
                             self.log_error(&format!("Download of '{}' failed permanently. Exhausted retries. Error: {}", active.url, err_msg));
                             self.current_download = None;
                             self.download_progress = 0.0;
+                            self.download_progress_shared = None;
                         }
                     } else {
                         self.status_message = format!("Download error: {}", err_msg);
@@ -893,43 +982,56 @@ impl eframe::App for SoundpadApp {
         egui::TopBottomPanel::top("top_menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("⚙ Settings").clicked() {
+                    let s_btn = ui.button("⚙ Settings");
+                    if s_btn.clicked() {
                         self.show_settings = true;
                         ui.close_menu();
                     }
+                    tooltip_above(&s_btn, ctx, "Open settings panel");
                     ui.separator();
-                    if ui.button("❌ Exit").clicked() {
+                    let e_btn = ui.button("❌ Exit");
+                    if e_btn.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    tooltip_above(&e_btn, ctx, "Close the application");
                 });
                 ui.menu_button("Help", |ui| {
-                    if ui.button("About").clicked() {
+                    let a_btn = ui.button("About");
+                    if a_btn.clicked() {
                         self.show_settings = true;
                         self.settings_tab = SettingsTab::About;
                         ui.close_menu();
                     }
+                    tooltip_above(&a_btn, ctx, "Version info and credits");
                 });
             });
         });
 
+        if self.config.show_quick_controls {
         egui::TopBottomPanel::top("quick_control_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(regular::PLAY).on_hover_text("Play selected sound").clicked() {
+                let pl_btn = ui.button(regular::PLAY);
+                if pl_btn.clicked() {
                     if let Some(idx) = self.selected_sound_idx {
                         self.play_sound_at_index(idx);
                     }
                 }
-                if ui.button(regular::PAUSE).on_hover_text("Pause/Resume sound").clicked() {
+                tooltip_above(&pl_btn, ctx, "Play selected sound");
+                let pa_btn = ui.button(regular::PAUSE);
+                if pa_btn.clicked() {
                     self.toggle_pause();
                 }
-                if ui.button(regular::STOP).on_hover_text("Stop playback").clicked() {
+                tooltip_above(&pa_btn, ctx, "Pause/Resume sound");
+                let st_btn = ui.button(regular::STOP);
+                if st_btn.clicked() {
                     self.stop_sound();
                 }
+                tooltip_above(&st_btn, ctx, "Stop playback");
 
                 ui.separator();
 
-                let (current_time, total_time) = {
+                let (current_time, total_time, has_active_sound) = {
                     if let Ok(state) = self.audio_state.lock() {
                         let cur = if state.total_samples > 0 && state.sample_rate > 0 {
                             state.current_sample_index as f32 / state.sample_rate as f32
@@ -937,19 +1039,34 @@ impl eframe::App for SoundpadApp {
                         let tot = if state.total_samples > 0 {
                             state.total_samples as f32 / state.sample_rate as f32
                         } else { 0.0 };
-                        (cur, tot)
+                        (cur, tot, state.active_sound.is_some())
                     } else {
-                        (0.0, 0.0)
+                        (0.0, 0.0, false)
                     }
                 };
 
-                self.seek_slider_value = current_time;
-                ui.add_enabled(
-                    false,
-                    egui::Slider::new(&mut self.seek_slider_value, 0.0..=total_time.max(0.01))
-                        .show_value(false)
-                        .text(""),
-                );
+                let slider_enabled = has_active_sound && total_time > 0.0;
+                let seek_idx = self.selected_sound_idx;
+
+                let slider = egui::Slider::new(&mut self.seek_slider_value, 0.0..=total_time.max(0.01))
+                    .show_value(false)
+                    .text("");
+                let slider_response = if slider_enabled {
+                    let s = ui.add(slider);
+                    tooltip_above(&s, ctx, "Drag to seek through the sound");
+                    s
+                } else {
+                    ui.add_enabled(false, slider)
+                };
+
+                if slider_response.drag_released() && slider_enabled {
+                    if let Some(idx) = seek_idx {
+                        self.play_sound_at_index_with_offset(idx, Some(self.seek_slider_value));
+                    }
+                }
+                if !slider_response.dragged() {
+                    self.seek_slider_value = current_time;
+                }
 
                 let format_time = |secs: f32| {
                     let total_secs = secs as u32;
@@ -963,116 +1080,121 @@ impl eframe::App for SoundpadApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(regular::HEADPHONES).on_hover_text("Monitoring volume (headphones)");
-                        ui.add_sized(
+                        let hp_lbl = ui.label(regular::HEADPHONES);
+                        tooltip_above(&hp_lbl, ctx, "Monitoring volume (headphones)");
+                        let hp_sl = ui.add_sized(
                             [80.0, 20.0],
                             egui::Slider::new(&mut self.config.volume_headphones, 0.0..=1.5)
                                 .show_value(false),
-                        )
-                        .on_hover_text("Headphone volume slider");
+                        );
+                        tooltip_above(&hp_sl, ctx, "Headphone volume");
                     });
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        ui.label(regular::SPEAKER_HIGH).on_hover_text("Sound output volume (virtual cable)");
-                        ui.add_sized(
+                        let sp_lbl = ui.label(regular::SPEAKER_HIGH);
+                        tooltip_above(&sp_lbl, ctx, "Sound output volume (virtual cable)");
+                        let sp_sl = ui.add_sized(
                             [80.0, 20.0],
                             egui::Slider::new(&mut self.config.volume_mic, 0.0..=1.5)
                                 .show_value(false),
-                        )
-                        .on_hover_text("Microphone (soundboard) volume slider");
+                        );
+                        tooltip_above(&sp_sl, ctx, "Soundboard volume");
                     });
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        ui.label(regular::MICROPHONE).on_hover_text("Physical microphone sensitivity");
-                        ui.add_sized(
+                        let mi_lbl = ui.label(regular::MICROPHONE);
+                        tooltip_above(&mi_lbl, ctx, "Physical microphone sensitivity");
+                        let mi_sl = ui.add_sized(
                             [80.0, 20.0],
                             egui::Slider::new(&mut self.config.volume_physical_mic, 0.0..=1.5)
                                 .show_value(false),
-                        )
-                        .on_hover_text("Real microphone volume slider");
+                        );
+                        tooltip_above(&mi_sl, ctx, "Real mic volume");
                     });
                 });
             });
             ui.add_space(4.0);
         });
+        }
 
-        if self.current_download.is_some() {
-            egui::TopBottomPanel::bottom("download_progress_bar")
-                .frame(egui::Frame {
-                    inner_margin: egui::Margin::ZERO,
-                    outer_margin: egui::Margin::ZERO,
-                    rounding: egui::Rounding::ZERO,
-                    shadow: egui::epaint::Shadow::NONE,
-                    fill: egui::Color32::TRANSPARENT,
-                    stroke: egui::Stroke::NONE,
-                })
-                .show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("footer_panel")
+            .frame(egui::Frame {
+                inner_margin: egui::Margin::symmetric(8.0, 8.0),
+                outer_margin: egui::Margin::ZERO,
+                rounding: egui::Rounding::ZERO,
+                shadow: egui::epaint::Shadow::NONE,
+                fill: ctx.style().visuals.panel_fill,
+                stroke: ctx.style().visuals.window_stroke,
+            })
+            .show(ctx, |ui| {
+                if self.current_download.is_some() {
                     let height = 4.0;
                     let size = egui::vec2(ui.available_width(), height);
                     let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
-
                     ui.painter().rect_filled(rect, egui::Rounding::ZERO, egui::Color32::from_gray(30));
-
                     let progress_width = rect.width() * self.download_progress;
                     let progress_rect = egui::Rect::from_min_size(rect.min, egui::vec2(progress_width, height));
                     ui.painter().rect_filled(progress_rect, egui::Rounding::ZERO, accent);
-                });
-        }
-
-        egui::TopBottomPanel::bottom("footer_panel").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if self.selected_category_idx < self.config.categories.len() {
-                    let current_icon = self.config.categories[self.selected_category_idx].icon.clone();
-                    ui.label(egui::RichText::new(current_icon).size(24.0).color(accent));
-
-                    let category_name = self.config.categories[self.selected_category_idx].name.clone();
-                    ui.label(egui::RichText::new(&category_name).strong());
-
-                    let sound_count = self.config.categories[self.selected_category_idx].sounds.len();
-                    let selected_str = if let Some(idx) = self.selected_sound_idx {
-                        format!("{}", idx + 1)
-                    } else {
-                        "0".to_string()
-                    };
-
-                    let total_plays: u32 = self.config.categories[self.selected_category_idx].sounds.iter().map(|s| s.play_count).sum();
-
-                    ui.separator();
-                    ui.label(format!("Sounds: {}", sound_count));
-                    ui.separator();
-                    ui.label(format!("Selected: {}", selected_str));
-                    ui.separator();
-                    ui.label(format!("Play Count: {}", total_plays));
+                    ui.add_space(6.0);
                 }
 
-                if !self.download_queue.is_empty() {
-                    ui.separator();
-                    ui.label(format!("Queue: {} item(s)", self.download_queue.len()));
-                }
+                ui.horizontal(|ui| {
+                    if self.selected_category_idx < self.config.categories.len() {
+                        let current_icon = self.config.categories[self.selected_category_idx].icon.clone();
+                        ui.label(egui::RichText::new(current_icon).size(24.0).color(accent));
 
-                if let Some(ref tag) = self.update_available {
-                    ui.separator();
-                    let btn_text = format!("⚡ Update Available: {} - View Release", tag);
-                    let btn = ui.button(egui::RichText::new(btn_text).color(egui::Color32::LIGHT_GREEN));
-                    if btn.clicked() {
-                        ctx.open_url(egui::OpenUrl::new_tab(format!(
-                            "https://github.com/makcnmflow/klwp-spad/releases/tag/{}",
-                            tag
-                        )));
+                        let category_name = self.config.categories[self.selected_category_idx].name.clone();
+                        ui.label(egui::RichText::new(&category_name).strong());
+
+                        let sound_count = self.config.categories[self.selected_category_idx].sounds.len();
+                        let selected_str = if let Some(idx) = self.selected_sound_idx {
+                            format!("{}", idx + 1)
+                        } else {
+                            "0".to_string()
+                        };
+
+                        let total_plays: u32 = self.config.categories[self.selected_category_idx].sounds.iter().map(|s| s.play_count).sum();
+
+                        ui.separator();
+                        let s_lbl = ui.label(format!("Sounds: {}", sound_count));
+                        tooltip_above(&s_lbl, ctx, "Total sounds in this category");
+                        ui.separator();
+                        let sel_lbl = ui.label(format!("Selected: {}", selected_str));
+                        tooltip_above(&sel_lbl, ctx, "Currently selected sound index");
+                        ui.separator();
+                        let p_lbl = ui.label(format!("Play Count: {}", total_plays));
+                        tooltip_above(&p_lbl, ctx, "Total times sounds in this category have been played");
                     }
-                }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(format!("{} GitHub", regular::GITHUB_LOGO)).on_hover_text("Open GitHub Repository").clicked() {
-                        ctx.open_url(egui::OpenUrl::new_tab("https://github.com/makcnmflow/klwp-spad"));
+                    if !self.download_queue.is_empty() {
+                        ui.separator();
+                        let q_lbl = ui.label(format!("Queue: {} item(s)", self.download_queue.len()));
+                        tooltip_above(&q_lbl, ctx, "Sounds waiting to be downloaded");
                     }
+
+                    if let Some(ref tag) = self.update_available {
+                        ui.separator();
+                        let btn_text = format!("⚡ Update Available: {} - View Release", tag);
+                        let btn = ui.button(egui::RichText::new(btn_text).color(egui::Color32::LIGHT_GREEN));
+                        if btn.clicked() {
+                            ctx.open_url(egui::OpenUrl::new_tab(format!(
+                                "https://github.com/makcnmflow/klwp-spad/releases/tag/{}",
+                                tag
+                            )));
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let gh_btn = ui.button(format!("{} GitHub", regular::GITHUB_LOGO));
+                        if gh_btn.clicked() {
+                            ctx.open_url(egui::OpenUrl::new_tab("https://github.com/makcnmflow/klwp-spad"));
+                        }
+                        tooltip_above(&gh_btn, ctx, "Open GitHub Repository");
+                    });
                 });
             });
-            ui.add_space(6.0);
-        });
 
         if self.show_logs {
             egui::TopBottomPanel::bottom("logs_panel")
@@ -1082,13 +1204,17 @@ impl eframe::App for SoundpadApp {
                     ui.horizontal(|ui| {
                         ui.small("Logs Console");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("📋 Copy Logs").on_hover_text("Copy all log records to clipboard").clicked() {
+                            let cp_btn = ui.button("📋 Copy");
+                            if cp_btn.clicked() {
                                 let full_logs = self.logs.join("\n");
                                 ctx.copy_text(full_logs);
                             }
-                            if ui.button("Hide Logs").clicked() {
+                            tooltip_above(&cp_btn, ctx, "Copy all log records to clipboard");
+                            let hd_btn = ui.button("Hide");
+                            if hd_btn.clicked() {
                                 self.show_logs = false;
                             }
+                            tooltip_above(&hd_btn, ctx, "Close the logs panel");
                         });
                     });
                     ui.separator();
@@ -1102,10 +1228,11 @@ impl eframe::App for SoundpadApp {
 
         egui::SidePanel::left("categories_panel")
             .resizable(true)
-            .default_width(180.0)
-            .width_range(120.0..=400.0)
+            .default_width(220.0)
+            .width_range(160.0..=450.0)
             .show(ctx, |ui| {
-                ui.heading("Categories");
+                let cat_h = ui.heading("Categories");
+                tooltip_above(&cat_h, ctx, "Right-click a category to rename or change its icon");
                 ui.separator();
 
                 egui::ScrollArea::vertical().id_source("categories_scroll").show(ui, |ui| {
@@ -1123,6 +1250,7 @@ impl eframe::App for SoundpadApp {
                             if resp.clicked() {
                                 self.selected_category_idx = i;
                                 self.selected_sound_idx = None;
+                                self.update_sorted_indices();
                                 self.log_info(&format!("Navigated to category: '{}'", cat_name));
                             }
 
@@ -1148,12 +1276,8 @@ impl eframe::App for SoundpadApp {
                                 ui.separator();
                                 ui.label(egui::RichText::new("Select Icon").strong());
 
-                                let available_icons = vec![
-                                    "📁", "🏠", "🎮", "🎵", "🔥", "😂", "👑", "🎙", "📢", "👾", "👽", "🐱", "🐶", "🍕", "🎬", "✨"
-                                ];
-
                                 ui.horizontal_wrapped(|ui| {
-                                    for icon in &available_icons {
+                                    for icon in AVAILABLE_ICONS {
                                         if ui.button(*icon).clicked() {
                                             icon_cmd = Some((i, icon.to_string()));
                                             ui.close_menu();
@@ -1172,11 +1296,13 @@ impl eframe::App for SoundpadApp {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.new_category_name)
+                    let name_inp = ui.add(egui::TextEdit::singleline(&mut self.new_category_name)
                         .hint_text("Name...")
                         .desired_width(70.0));
+                    tooltip_above(&name_inp, ctx, "Type a name and click + to create a new category");
 
-                    if ui.button(format!("{} Add", regular::PLUS)).clicked() {
+                    let add_cat = ui.button(format!("{} Add", regular::PLUS));
+                    if add_cat.clicked() {
                         let name = self.new_category_name.trim().to_string();
                         if !name.is_empty() && !self.config.categories.iter().any(|c| c.name == name) {
                             self.config.categories.push(CategoryConfig {
@@ -1189,13 +1315,15 @@ impl eframe::App for SoundpadApp {
                             self.log_info(&format!("Created new playlist category: '{}'", name));
                         }
                     }
+                    tooltip_above(&add_cat, ctx, "Create a new category folder");
                 });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    if ui.button(format!("{} Add sound to list...", regular::PLUS)).clicked() {
+                    let add_snd = ui.button(format!("{} Add sound to list...", regular::PLUS));
+                    if add_snd.clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file()
                         {
                             let title = path.file_stem()
@@ -1216,56 +1344,127 @@ impl eframe::App for SoundpadApp {
                             }
 
                             if self.selected_category_idx < self.config.categories.len() {
+                                let duration_secs = get_duration_seconds(&final_path.display().to_string());
                                 self.config.categories[self.selected_category_idx].sounds.push(SoundConfig {
                                     title: title.clone(),
                                     path: final_path.display().to_string(),
                                     duration,
                                     hotkey: None,
                                     play_count: 0,
+                                    duration_secs,
                                 });
                                 self.save_app_config();
+                                self.update_sorted_indices();
                                 self.log_info(&format!("Imported: '{}'", title));
                             }
                         }
                     }
+                    tooltip_above(&add_snd, ctx, "Import an audio file (MP3, WAV, FLAC, OGG)");
                 });
 
                 ui.add_space(5.0);
 
                 if self.selected_category_idx < self.config.categories.len() {
-                    let sound_count = self.config.categories[self.selected_category_idx].sounds.len();
-
                     egui::ScrollArea::both().id_source("sound_table_scroll").show(ui, |ui| {
                         egui::Grid::new("sound_table_grid")
                             .striped(true)
                             .num_columns(5)
                             .spacing([15.0, 8.0])
                             .show(ui, |ui| {
-                                ui.label("No.");
-                                ui.label("Title");
-                                ui.label("Duration");
-                                ui.label("Hotkey");
-                                ui.label("Delete");
+                                fn sort_label(col: &Option<SortColumn>, asc: bool, target: &SortColumn) -> String {
+                                    match col {
+                                        Some(c) if c == target => {
+                                            if asc { format!(" {}", regular::CARET_UP) } else { format!(" {}", regular::CARET_DOWN) }
+                                        }
+                                        _ => "".to_string()
+                                    }
+                                }
+
+                                let n_btn = ui.button(format!("No.{}", sort_label(&self.sort_column, self.sort_ascending, &SortColumn::Number)));
+                                if n_btn.clicked() {
+                                    self.selected_sound_idx = None;
+                                    if self.sort_column == Some(SortColumn::Number) {
+                                        self.sort_ascending = !self.sort_ascending;
+                                    } else {
+                                        self.sort_column = Some(SortColumn::Number);
+                                        self.sort_ascending = true;
+                                    }
+                                    self.update_sorted_indices();
+                                }
+                                tooltip_above(&n_btn, ctx, "Sort by index");
+
+                                let t_btn = ui.button(format!("Title{}", sort_label(&self.sort_column, self.sort_ascending, &SortColumn::Title)));
+                                if t_btn.clicked() {
+                                    self.selected_sound_idx = None;
+                                    if self.sort_column == Some(SortColumn::Title) {
+                                        self.sort_ascending = !self.sort_ascending;
+                                    } else {
+                                        self.sort_column = Some(SortColumn::Title);
+                                        self.sort_ascending = true;
+                                    }
+                                    self.update_sorted_indices();
+                                }
+                                tooltip_above(&t_btn, ctx, "Sort alphabetically");
+
+                                let d_btn = ui.button(format!("Duration{}", sort_label(&self.sort_column, self.sort_ascending, &SortColumn::Duration)));
+                                if d_btn.clicked() {
+                                    self.selected_sound_idx = None;
+                                    if self.sort_column == Some(SortColumn::Duration) {
+                                        self.sort_ascending = !self.sort_ascending;
+                                    } else {
+                                        self.sort_column = Some(SortColumn::Duration);
+                                        self.sort_ascending = true;
+                                    }
+                                    self.update_sorted_indices();
+                                }
+                                tooltip_above(&d_btn, ctx, "Sort by length");
+
+                                let h_lbl = ui.label("Hotkey");
+                                tooltip_above(&h_lbl, ctx, "Keyboard shortcut - click to assign or change");
+                                let del_lbl = ui.label("Delete");
+                                tooltip_above(&del_lbl, ctx, "Remove this sound from the list");
                                 ui.end_row();
 
                                 let mut to_remove = None;
 
-                                for idx in 0..sound_count {
-                                    let is_selected = Some(idx) == self.selected_sound_idx;
-                                    let sound_title = self.config.categories[self.selected_category_idx].sounds[idx].title.clone();
-                                    let sound_duration = self.config.categories[self.selected_category_idx].sounds[idx].duration.clone();
-                                    let sound_hotkey_opt = self.config.categories[self.selected_category_idx].sounds[idx].hotkey.clone();
+                                let cat_idx = self.selected_category_idx;
+                                let sorted = self.sorted_indices.clone();
+                                for &original_idx in &sorted {
+                                    let is_selected = Some(original_idx) == self.selected_sound_idx;
+                                    let sound_title = self.config.categories[cat_idx].sounds[original_idx].title.clone();
+                                    let sound_duration = self.config.categories[cat_idx].sounds[original_idx].duration.clone();
+                                    let sound_hotkey_opt = self.config.categories[cat_idx].sounds[original_idx].hotkey.clone();
 
-                                    ui.label((idx + 1).to_string());
+                                    ui.label((original_idx + 1).to_string());
 
                                     let resp = ui.selectable_label(is_selected, &sound_title);
                                     if resp.clicked() {
-                                        self.selected_sound_idx = Some(idx);
+                                        self.selected_sound_idx = Some(original_idx);
                                     }
                                     if resp.double_clicked() {
-                                        self.selected_sound_idx = Some(idx);
-                                        self.play_sound_at_index(idx);
+                                        self.selected_sound_idx = Some(original_idx);
+                                        self.play_sound_at_index(original_idx);
                                     }
+
+                                    resp.context_menu(|ui| {
+                                        ui.set_min_width(180.0);
+                                        ui.label(egui::RichText::new("Rename Sound").strong());
+
+                                        let edit_id = ui.make_persistent_id(format!("snd_edit_{}", original_idx));
+                                        let mut temp_name = ui.data(|d| d.get_temp::<String>(edit_id))
+                                            .unwrap_or_else(|| sound_title.clone());
+
+                                        let name_edit = ui.text_edit_singleline(&mut temp_name);
+                                        ui.data_mut(|d| d.insert_temp(edit_id, temp_name.clone()));
+
+                                        if name_edit.lost_focus() || (name_edit.gained_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                            let trimmed = temp_name.trim().to_string();
+                                            if !trimmed.is_empty() && trimmed != sound_title {
+                                                self.sound_rename_cmd = Some((original_idx, trimmed));
+                                            }
+                                            ui.data_mut(|d| d.remove::<String>(edit_id));
+                                        }
+                                    });
 
                                     ui.label(&sound_duration);
 
@@ -1274,20 +1473,25 @@ impl eframe::App for SoundpadApp {
                                         None => "Assign".to_string(),
                                     };
 
-                                    if ui.button(hk_text).clicked() {
+                                    let hk_btn = ui.button(hk_text);
+                                    if hk_btn.clicked() {
                                         if sound_hotkey_opt.is_some() {
-                                            self.hotkey_options_idx = Some(idx);
+                                            self.hotkey_options_idx = Some(original_idx);
                                         } else {
                                             self.recording_state = Some(RecordingState {
-                                                sound_idx: idx,
+                                                sound_idx: original_idx,
                                                 recorded_combination: None,
                                             });
                                         }
                                     }
+                                    let hk_tip = if sound_hotkey_opt.is_some() { "Click to change or remove this hotkey" } else { "Click to assign a keyboard shortcut" };
+                                    tooltip_above(&hk_btn, ctx, hk_tip);
 
-                                    if ui.button(regular::TRASH).clicked() {
-                                        to_remove = Some(idx);
+                                    let tr_btn = ui.button(regular::TRASH);
+                                    if tr_btn.clicked() {
+                                        to_remove = Some(original_idx);
                                     }
+                                    tooltip_above(&tr_btn, ctx, "Delete this sound");
 
                                     ui.end_row();
                                 }
@@ -1309,6 +1513,7 @@ impl eframe::App for SoundpadApp {
                                     self.config.categories[self.selected_category_idx].sounds.remove(idx);
                                     self.selected_sound_idx = None;
                                     self.save_app_config();
+                                    self.update_sorted_indices();
                                     self.update_global_hotkeys();
                                 }
                             });
@@ -1345,23 +1550,29 @@ impl eframe::App for SoundpadApp {
                         ui.add_space(15.0);
 
                         ui.horizontal(|ui| {
-                            if ui.button("Save").clicked() {
+                            let sv_btn = ui.button("Save");
+                            if sv_btn.clicked() {
                                 save_combination = Some(combo.clone());
                                 sound_idx_to_save = current_sound_idx;
                                 should_close_rec = true;
                             }
-                            if ui.button("Reset").clicked() {
+                            tooltip_above(&sv_btn, ctx, "Save this hotkey combination");
+                            let rs_btn = ui.button("Reset");
+                            if rs_btn.clicked() {
                                 rec.recorded_combination = None;
                             }
+                            tooltip_above(&rs_btn, ctx, "Clear and try again");
                         });
                     } else {
                         ui.colored_label(egui::Color32::LIGHT_YELLOW, "Awaiting keys...");
                     }
 
                     ui.add_space(10.0);
-                    if ui.button("Cancel").clicked() {
+                    let cc_btn = ui.button("Cancel");
+                    if cc_btn.clicked() {
                         should_close_rec = true;
                     }
+                    tooltip_above(&cc_btn, ctx, "Close without saving");
                 });
         }
 
@@ -1400,19 +1611,25 @@ impl eframe::App for SoundpadApp {
                     ui.add_space(15.0);
 
                     ui.horizontal(|ui| {
-                        if ui.button("Change Hotkey").clicked() {
+                        let ch_btn = ui.button("Change Hotkey");
+                        if ch_btn.clicked() {
                             should_change_hk = true;
                             should_close_hk_options = true;
                         }
-                        if ui.button("Remove Hotkey").clicked() {
+                        tooltip_above(&ch_btn, ctx, "Assign a new keyboard shortcut");
+                        let rm_btn = ui.button("Remove Hotkey");
+                        if rm_btn.clicked() {
                             should_remove_hk = true;
                             should_close_hk_options = true;
                         }
+                        tooltip_above(&rm_btn, ctx, "Clear the current hotkey");
                     });
                     ui.add_space(10.0);
-                    if ui.button("Close").clicked() {
+                    let cl_btn = ui.button("Close");
+                    if cl_btn.clicked() {
                         should_close_hk_options = true;
                     }
+                    tooltip_above(&cl_btn, ctx, "Return to sound list");
                 });
         }
 
@@ -1451,11 +1668,18 @@ impl eframe::App for SoundpadApp {
 
                     if !self.config.is_first_run {
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.settings_tab, SettingsTab::Devices, "Devices");
-                            ui.selectable_value(&mut self.settings_tab, SettingsTab::Hotkeys, "Hotkeys");
-                            ui.selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "Appearance");
-                            ui.selectable_value(&mut self.settings_tab, SettingsTab::Categories, "Categories");
-                            ui.selectable_value(&mut self.settings_tab, SettingsTab::About, "About");
+                            let d_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::Devices, "Devices");
+                            tooltip_above(&d_tab, ctx, "Audio input/output device selection");
+                            let h_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::Hotkeys, "Hotkeys");
+                            tooltip_above(&h_tab, ctx, "Global keyboard shortcut settings");
+                            let au_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::Audio, "Audio");
+                            tooltip_above(&au_tab, ctx, "Volume levels and audio behavior");
+                            let a_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "Appearance");
+                            tooltip_above(&a_tab, ctx, "Theme colors, font size, and Discord RPC");
+                            let c_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::Categories, "Categories");
+                            tooltip_above(&c_tab, ctx, "Manage category folders and icons");
+                            let ab_tab = ui.selectable_value(&mut self.settings_tab, SettingsTab::About, "About");
+                            tooltip_above(&ab_tab, ctx, "Version info and credits");
                         });
                         ui.separator();
                     } else {
@@ -1466,7 +1690,8 @@ impl eframe::App for SoundpadApp {
                     match self.settings_tab {
                         SettingsTab::Devices => {
                             egui::Grid::new("settings_devices_grid").spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Microphone:");
+                                let mic_lbl = ui.label("Microphone:");
+                                tooltip_above(&mic_lbl, ctx, "Your physical microphone input device");
                                 egui::ComboBox::from_id_source("set_mic")
                                     .selected_text(&self.config.selected_input)
                                     .show_ui(ui, |ui| {
@@ -1476,7 +1701,8 @@ impl eframe::App for SoundpadApp {
                                     });
                                 ui.end_row();
 
-                                ui.label("Virtual Cable (Input):");
+                                let vc_lbl = ui.label("Virtual Cable:");
+                                tooltip_above(&vc_lbl, ctx, "The VB-Cable output device that sends audio to Discord/voice chat");
                                 egui::ComboBox::from_id_source("set_cable")
                                     .selected_text(&self.config.selected_output)
                                     .show_ui(ui, |ui| {
@@ -1486,7 +1712,8 @@ impl eframe::App for SoundpadApp {
                                     });
                                 ui.end_row();
 
-                                ui.label("Monitoring (Headphones):");
+                                let hp_lbl = ui.label("Headphones:");
+                                tooltip_above(&hp_lbl, ctx, "Your headphones or monitoring device to hear soundboard playback");
                                 egui::ComboBox::from_id_source("set_mon")
                                     .selected_text(&self.config.selected_monitoring)
                                     .show_ui(ui, |ui| {
@@ -1498,18 +1725,17 @@ impl eframe::App for SoundpadApp {
                             });
 
                             ui.separator();
-                            ui.checkbox(&mut self.config.verify_config_startup, "Verify device configuration on startup");
-                            ui.checkbox(&mut self.config.disable_drm_check, "Disable DRM checks for Windows Audio services");
-                            ui.checkbox(&mut self.config.block_echo, "Block self-monitoring microphone echo loop");
-                            ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute physical microphone while a sound is playing");
+                            let mute_cb = ui.checkbox(&mut self.config.mute_mic_during_playback, "Mute microphone while sound plays");
+                            tooltip_above(&mute_cb, ctx, "Automatically lower your real mic when a soundboard sound is playing, to prevent echo");
                         }
                         SettingsTab::Hotkeys => {
-                            ui.label("Global Hotkey Manager:");
-                            ui.checkbox(&mut self.config.enable_global_hotkeys, "Enable global hotkey system");
-                            ui.small("If disabled, assigned hotkeys will only trigger when the window is focused.");
+                            let gh_cb = ui.checkbox(&mut self.config.enable_global_hotkeys, "Global hotkeys");
+                            tooltip_above(&gh_cb, ctx, "Let sound hotkeys work even when the app window is not focused");
+                            ui.small("Disable this if hotkeys interfere with other apps.");
                             ui.add_space(10.0);
 
-                            if ui.button("Reset all hotkeys").clicked() {
+                            let rst_hk = ui.button("Reset all hotkeys");
+                            if rst_hk.clicked() {
                                 for category in &mut self.config.categories {
                                     for sound in &mut category.sounds {
                                         sound.hotkey = None;
@@ -1519,10 +1745,44 @@ impl eframe::App for SoundpadApp {
                                 self.update_global_hotkeys();
                                 self.log_warn("All registered shortcut configurations have been cleared.");
                             }
+                            tooltip_above(&rst_hk, ctx, "Remove all assigned hotkeys from every sound");
+                        }
+                        SettingsTab::Audio => {
+                            ui.label("Volume levels (0–150%):");
+                            ui.add_space(4.0);
+                            egui::Grid::new("vol_grid").spacing([10.0, 6.0]).show(ui, |ui| {
+                                let mut vol_mic_pct = (self.config.volume_mic * 100.0) as u32;
+                                ui.label("Soundboard:");
+                                ui.add(egui::Slider::new(&mut self.config.volume_mic, 0.0..=1.5).text(""));
+                                let vl_mic = ui.add(egui::DragValue::new(&mut vol_mic_pct).speed(1).clamp_range(0..=150));
+                                if vl_mic.changed() || vl_mic.lost_focus() {
+                                    self.config.volume_mic = (vol_mic_pct as f32 / 100.0).clamp(0.0, 1.5);
+                                }
+                                ui.end_row();
+
+                                let mut vol_hp_pct = (self.config.volume_headphones * 100.0) as u32;
+                                ui.label("Headphones:");
+                                ui.add(egui::Slider::new(&mut self.config.volume_headphones, 0.0..=1.5).text(""));
+                                let vl_hp = ui.add(egui::DragValue::new(&mut vol_hp_pct).speed(1).clamp_range(0..=150));
+                                if vl_hp.changed() || vl_hp.lost_focus() {
+                                    self.config.volume_headphones = (vol_hp_pct as f32 / 100.0).clamp(0.0, 1.5);
+                                }
+                                ui.end_row();
+
+                                let mut vol_mic_phys_pct = (self.config.volume_physical_mic * 100.0) as u32;
+                                ui.label("Microphone:");
+                                ui.add(egui::Slider::new(&mut self.config.volume_physical_mic, 0.0..=1.5).text(""));
+                                let vl_mp = ui.add(egui::DragValue::new(&mut vol_mic_phys_pct).speed(1).clamp_range(0..=150));
+                                if vl_mp.changed() || vl_mp.lost_focus() {
+                                    self.config.volume_physical_mic = (vol_mic_phys_pct as f32 / 100.0).clamp(0.0, 1.5);
+                                }
+                                ui.end_row();
+                            });
                         }
                         SettingsTab::Appearance => {
                             egui::Grid::new("set_app_grid").spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Accent Color:");
+                                let ac_lbl = ui.label("Accent Color:");
+                                tooltip_above(&ac_lbl, ctx, "Change the theme accent color for buttons and highlights");
                                 egui::ComboBox::from_id_source("set_accent")
                                     .selected_text(&self.config.accent_color)
                                     .show_ui(ui, |ui| {
@@ -1532,13 +1792,20 @@ impl eframe::App for SoundpadApp {
                                     });
                                 ui.end_row();
 
-                                ui.label("Font Size:");
+                                let fs_lbl = ui.label("Font Size:");
+                                tooltip_above(&fs_lbl, ctx, "Adjust the UI text size");
                                 ui.add(egui::Slider::new(&mut self.config.font_size, 11.0..=22.0).text("px"));
                                 ui.end_row();
                             });
                             ui.separator();
-                            ui.checkbox(&mut self.config.enable_discord_rpc, "Enable Discord Rich Presence status");
-                            ui.checkbox(&mut self.show_logs, "Show Logs Console panel");
+                            let drpc_cb = ui.checkbox(&mut self.config.enable_discord_rpc, "Discord Rich Presence");
+                            tooltip_above(&drpc_cb, ctx, "Show 'Playing KLWP SPAD' in your Discord status");
+                            let qc_cb = ui.checkbox(&mut self.config.show_quick_controls, "Quick controls bar");
+                            tooltip_above(&qc_cb, ctx, "Show the top toolbar with play/pause and volume sliders");
+                            let focus_cb = ui.checkbox(&mut self.config.focus_on_sound_link, "Focus window on sound link");
+                            tooltip_above(&focus_cb, ctx, "Automatically bring the app to front when a soundpad:// or voicemod: link is received");
+                            let log_cb = ui.checkbox(&mut self.show_logs, "Logs Console");
+                            tooltip_above(&log_cb, ctx, "Show a debug log panel at the bottom of the window");
                         }
                         SettingsTab::Categories => {
                             ui.label("Manage Categories:");
@@ -1546,9 +1813,6 @@ impl eframe::App for SoundpadApp {
                             ui.add_space(10.0);
 
                             let mut to_remove = None;
-                            let available_icons = vec![
-                                "📁", "🏠", "🎮", "🎵", "🔥", "😂", "👑", "🎙", "📢", "👾", "👽", "🐱", "🐶", "🍕", "🎬", "✨"
-                            ];
 
                             egui::ScrollArea::vertical().id_source("settings_categories_scroll").show(ui, |ui| {
                                 egui::Grid::new("settings_categories_grid")
@@ -1564,7 +1828,7 @@ impl eframe::App for SoundpadApp {
                                             egui::ComboBox::from_id_source(format!("icon_select_{}", i))
                                                 .selected_text(&cat.icon)
                                                 .show_ui(ui, |ui| {
-                                                    for icon in &available_icons {
+                                                    for icon in AVAILABLE_ICONS {
                                                         let icon_str = icon.to_string();
                                                         if ui.selectable_value(&mut cat.icon, icon_str.clone(), icon_str).clicked() {
                                                             self.config.categories[i].icon = cat.icon.clone();
@@ -1590,6 +1854,7 @@ impl eframe::App for SoundpadApp {
                                 self.config.categories.remove(idx);
                                 self.selected_category_idx = 0;
                                 self.selected_sound_idx = None;
+                                self.update_sorted_indices();
                                 self.save_app_config();
                                 self.update_global_hotkeys();
                                 self.log_info(&format!("Deleted category: '{}'", removed_name));
@@ -1619,7 +1884,7 @@ impl eframe::App for SoundpadApp {
 
                                 ui.add_space(15.0);
                                 let version = env!("APP_VERSION");
-                                let ver_str = if version.starts_with('1') || version.starts_with('2') || version.starts_with('0') {
+                                let ver_str = if version.starts_with(|c: char| c.is_ascii_digit()) {
                                     format!("v{}", version)
                                 } else {
                                     version.to_string()
@@ -1633,7 +1898,8 @@ impl eframe::App for SoundpadApp {
                     ui.horizontal(|ui| {
                         let button_text = if self.config.is_first_run { "Finish Setup" } else { "Apply and Close" };
 
-                        if ui.button(button_text).clicked() {
+                        let apply_btn = ui.button(button_text);
+                        if apply_btn.clicked() {
                             self.config.is_first_run = false;
                             self.show_settings = false;
 
@@ -1650,18 +1916,9 @@ impl eframe::App for SoundpadApp {
                             }
 
                             self.save_app_config();
-
-                            self.start_streaming();
-                            self.update_global_hotkeys();
-
-                            let _ = self.discord_tx.send(DiscordMsg::UpdateStatus {
-                                enabled: self.config.enable_discord_rpc,
-                            });
-
-                            let auto_cable_mic = find_virtual_cable_microphone(&self.config.selected_output, &self.input_devices);
-                            set_default_windows_microphone(&auto_cable_mic);
-                            self.log_info("Settings applied and saved successfully.");
+                            self.pending_apply = true;
                         }
+                        tooltip_above(&apply_btn, ctx, "Save settings and restart audio streaming");
                     });
                 });
         }
@@ -1680,12 +1937,73 @@ impl eframe::App for SoundpadApp {
             self.log_info(&format!("Changed category '{}' icon to {}", cat_name, new_icon));
         }
 
+        if let Some((idx, new_name)) = self.sound_rename_cmd.take() {
+            if self.selected_category_idx < self.config.categories.len() {
+                let cat = &mut self.config.categories[self.selected_category_idx];
+                if idx < cat.sounds.len() {
+                    let old_name = cat.sounds[idx].title.clone();
+                    cat.sounds[idx].title = new_name.clone();
+                    self.save_app_config();
+                    self.log_info(&format!("Renamed sound '{}' to '{}'", old_name, new_name));
+                }
+            }
+        }
+
+        if self.pending_apply {
+            self.pending_apply = false;
+            self.input_stream = None;
+            self.output_stream = None;
+            self.monitoring_stream = None;
+            self.update_global_hotkeys();
+            let _ = self.discord_tx.send(DiscordMsg::UpdateStatus {
+                enabled: self.config.enable_discord_rpc,
+            });
+            let auto_cable_mic = find_virtual_cable_microphone(&self.config.selected_output, &self.input_devices);
+            set_default_windows_microphone(&auto_cable_mic);
+            self.status_message = "Settings applied. Audio will restart on next playback.".to_string();
+            self.log_info("Settings applied. Audio streams will restart on next playback.");
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+}
+
+fn tooltip_above(response: &egui::Response, ctx: &egui::Context, text: &str) {
+    if response.hovered() {
+        let pos = egui::pos2(
+            (response.rect.center().x - 60.0).max(0.0),
+            (response.rect.top() - 28.0).max(0.0),
+        );
+        egui::Area::new(egui::Id::new(("tooltip", text)))
+            .fixed_pos(pos)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                    ui.label(text);
+                });
+            });
     }
 }
 
 fn is_modifier_key(_key: egui::Key) -> bool {
     false
+}
+
+fn parse_version(v: &str) -> Vec<u32> {
+    v.trim_start_matches(|c: char| c.is_alphabetic())
+        .split('.')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect()
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let current_parts = parse_version(current);
+    let latest_parts = parse_version(latest);
+    for (l, c) in latest_parts.iter().zip(current_parts.iter()) {
+        if l > c { return true; }
+        if l < c { return false; }
+    }
+    latest_parts.len() > current_parts.len()
 }
 
 fn map_key_to_hotkey_string(key: egui::Key, modifiers: &egui::Modifiers) -> String {

@@ -3,13 +3,14 @@ use ringbuf::HeapRb;
 use rodio::Source;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 pub struct ActiveSound {
     pub consumer_mic: ringbuf::Consumer<f32, Arc<HeapRb<f32>>>,
     pub consumer_headphones: ringbuf::Consumer<f32, Arc<HeapRb<f32>>>,
-    pub stop_signal: Arc<Mutex<bool>>,
-    pub finished_decoding: Arc<Mutex<bool>>,
+    pub stop_signal: Arc<AtomicBool>,
+    pub finished_decoding: Arc<AtomicBool>,
 }
 
 pub struct AudioState {
@@ -139,45 +140,46 @@ pub fn start_audio_streams(
     let mut monitoring_rate = 44100;
 
     if monitoring_device_name != "[Disabled]" && !monitoring_device_name.is_empty() {
-        if let Some(mon_device) = host
-            .output_devices()
-            .unwrap()
-            .find(|d| d.name().map(|n| n == monitoring_device_name).unwrap_or(false))
-        {
-            if let Ok(mon_config) = mon_device.default_output_config() {
-                monitoring_rate = mon_config.sample_rate().0;
-                let mon_channels = mon_config.channels() as usize;
-                let audio_state_clone = Arc::clone(&audio_state);
+        if let Ok(mut mon_devices) = host.output_devices() {
+            if let Some(mon_device) = mon_devices
+                .find(|d| d.name().map(|n| n == monitoring_device_name).unwrap_or(false))
+            {
+                if let Ok(mon_config) = mon_device.default_output_config() {
+                    monitoring_rate = mon_config.sample_rate().0;
+                    let mon_channels = mon_config.channels() as usize;
+                    let audio_state_clone = Arc::clone(&audio_state);
 
-                let mon_stream = mon_device.build_output_stream(
-                    &mon_config.config(),
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let mut state = audio_state_clone.lock().unwrap();
-                        let mut i = 0;
-
-                        while i < data.len() {
-                            let mut sound_sample: f32 = 0.0;
+                    let mon_stream = mon_device.build_output_stream(
+                        &mon_config.config(),
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            let mut state = audio_state_clone.lock().unwrap();
+                            let mut i = 0;
                             let vol = state.volume_headphones;
+                            let is_paused = state.is_paused;
 
-                            if !state.is_paused {
-                                if let Some(ref mut sound) = state.active_sound {
-                                    sound_sample = sound.consumer_headphones.pop().unwrap_or(0.0) * vol;
+                            while i < data.len() {
+                                let mut sound_sample: f32 = 0.0;
+
+                                if !is_paused {
+                                    if let Some(ref mut sound) = state.active_sound {
+                                        sound_sample = sound.consumer_headphones.pop().unwrap_or(0.0) * vol;
+                                    }
+                                }
+
+                                for _ in 0..mon_channels {
+                                    if i < data.len() {
+                                        data[i] = sound_sample.clamp(-1.0, 1.0);
+                                        i += 1;
+                                    }
                                 }
                             }
-
-                            for _ in 0..mon_channels {
-                                if i < data.len() {
-                                    data[i] = sound_sample.clamp(-1.0, 1.0);
-                                    i += 1;
-                                }
-                            }
-                        }
-                    },
-                    |err| eprintln!("Monitoring error: {:?}", err),
-                    None,
-                )?;
-                mon_stream.play()?;
-                monitoring_stream = Some(mon_stream);
+                        },
+                        |err| eprintln!("Monitoring error: {:?}", err),
+                        None,
+                    )?;
+                    mon_stream.play()?;
+                    monitoring_stream = Some(mon_stream);
+                }
             }
         }
     }
@@ -190,22 +192,25 @@ pub fn start_audio_streams(
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let mut state = audio_state_clone.lock().unwrap();
             let mut i = 0;
+            let vol_mic = state.volume_mic;
+            let vol_physical = state.volume_physical_mic;
+            let is_paused = state.is_paused;
+            let mute_mic = state.mute_mic_during_playback;
 
             while i < data.len() {
-                let mic_playing = !state.is_paused && state.active_sound.is_some();
-                let effective_mic_vol = if state.mute_mic_during_playback && mic_playing {
+                let mic_playing = !is_paused && state.active_sound.is_some();
+                let effective_mic_vol = if mute_mic && mic_playing {
                     0.0
                 } else {
-                    state.volume_physical_mic
+                    vol_physical
                 };
                 let mic_sample = consumer.pop().unwrap_or(0.0) * effective_mic_vol;
                 let mut sound_sample: f32 = 0.0;
-                let vol = state.volume_mic;
 
-                if !state.is_paused {
+                if !is_paused {
                     if let Some(ref mut sound) = state.active_sound {
                         if let Some(sample) = sound.consumer_mic.pop() {
-                            sound_sample = sample * vol;
+                            sound_sample = sample * vol_mic;
                             state.current_sample_index += 1;
                         }
                     }

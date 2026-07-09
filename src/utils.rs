@@ -1,16 +1,32 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub fn url_decode(input: &str) -> String {
     let mut decoded = String::new();
     let mut chars = input.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
             let mut hex = String::new();
-            if let Some(h1) = chars.next() { hex.push(h1); }
-            if let Some(h2) = chars.next() { hex.push(h2); }
-            if let Ok(val) = u8::from_str_radix(&hex, 16) {
-                decoded.push(val as char);
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1c), Some(h2c)) = (h1, h2) {
+                hex.push(h1c);
+                hex.push(h2c);
+                if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                    decoded.push(val as char);
+                } else {
+                    decoded.push('%');
+                    decoded.push(h1c);
+                    decoded.push(h2c);
+                }
             } else {
                 decoded.push('%');
-                decoded.push_str(&hex);
+                if let Some(h) = h1 {
+                    decoded.push(h);
+                }
             }
         } else if c == '+' {
             decoded.push(' ');
@@ -126,7 +142,7 @@ internal interface IPropertyStore {
     [PreserveSig]
     int GetAt(uint iProp, out IntPtr pkey);
     [PreserveSig]
-    int GetValue(ref PROPERTYKEY key, [In, Out] PROPVARIANT pv);
+    int GetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -136,7 +152,7 @@ internal struct PROPERTYKEY {
 }
 
 [StructLayout(LayoutKind.Explicit)]
-internal class PROPVARIANT {
+internal struct PROPVARIANT {
     [FieldOffset(0)] public ushort vt;
     [FieldOffset(8)] public IntPtr ptr;
 }
@@ -165,9 +181,8 @@ public class AudioChanger {
                 key.fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");
                 key.pid = 14;
 
-                PROPVARIANT pv = new PROPVARIANT();
-                propStore.GetValue(ref key, pv);
-
+                PROPVARIANT pv = default;
+                propStore.GetValue(ref key, ref pv);
                 string name = Marshal.PtrToStringUni(pv.ptr);
 
                 if (name != null && name.IndexOf(friendlyName, StringComparison.OrdinalIgnoreCase) >= 0) {
@@ -194,14 +209,15 @@ Add-Type -TypeDefinition $code -ErrorAction SilentlyContinue
 
     let script = script_template.replace("__DEVICE_NAME__", &escaped_name);
 
-    let _ = std::process::Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-WindowStyle", "Hidden",
-            "-Command", &script
-        ])
-        .output();
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(&[
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", &script,
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.spawn();
 }
 
 fn ffmpeg_path() -> Option<String> {
@@ -214,9 +230,11 @@ fn ffmpeg_path() -> Option<String> {
             return Some(candidate.display().to_string());
         }
     }
-    if std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
+    let mut ff_cmd = std::process::Command::new("ffmpeg");
+    ff_cmd.arg("-version");
+    #[cfg(windows)]
+    ff_cmd.creation_flags(CREATE_NO_WINDOW);
+    if ff_cmd.output()
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
@@ -238,18 +256,19 @@ pub fn try_convert_with_ffmpeg(path: &str) -> Option<String> {
     let output_path = out_dir.join(format!("{}_converted.wav", stem));
     let output_str = output_path.display().to_string();
 
-    let status = std::process::Command::new(&ffmpeg)
-        .args(&[
-            "-y",
-            "-i", path,
-            "-vn",
-            "-acodec", "pcm_s16le",
-            "-ar", "44100",
-            "-ac", "2",
-            &output_str,
-        ])
-        .output()
-        .ok()?;
+    let mut ff_cmd = std::process::Command::new(&ffmpeg);
+    ff_cmd.args(&[
+        "-y",
+        "-i", path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        &output_str,
+    ]);
+    #[cfg(windows)]
+    ff_cmd.creation_flags(CREATE_NO_WINDOW);
+    let status = ff_cmd.output().ok()?;
 
     if status.status.success() && output_path.exists() {
         Some(output_str)
@@ -289,14 +308,15 @@ foreach ($p in $protocols) {{
         exe_str, exe_str
     );
 
-    let _ = std::process::Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-WindowStyle", "Hidden",
-            "-Command", &script
-        ])
-        .output();
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(&[
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", &script,
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.output();
 
     Ok(())
 }

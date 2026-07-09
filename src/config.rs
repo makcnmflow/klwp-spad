@@ -12,6 +12,8 @@ pub struct SoundConfig {
     pub hotkey: Option<String>,
     #[serde(default)]
     pub play_count: u32,
+    #[serde(default)]
+    pub duration_secs: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -38,17 +40,15 @@ pub struct AppConfig {
     #[serde(default = "default_font_size")]
     pub font_size: f32,
     #[serde(default = "default_true")]
-    pub verify_config_startup: bool,
-    #[serde(default = "default_true")]
-    pub disable_drm_check: bool,
-    #[serde(default = "default_true")]
-    pub block_echo: bool,
-    #[serde(default = "default_true")]
     pub mute_mic_during_playback: bool,
     #[serde(default = "default_true")]
     pub enable_global_hotkeys: bool,
     #[serde(default = "default_true")]
     pub enable_discord_rpc: bool,
+    #[serde(default = "default_true")]
+    pub focus_on_sound_link: bool,
+    #[serde(default = "default_true")]
+    pub show_quick_controls: bool,
 }
 
 fn default_accent_color() -> String {
@@ -109,12 +109,11 @@ impl Default for AppConfig {
             ],
             accent_color: default_accent_color(),
             font_size: default_font_size(),
-            verify_config_startup: default_true(),
-            disable_drm_check: default_true(),
-            block_echo: default_true(),
             mute_mic_during_playback: default_true(),
             enable_global_hotkeys: default_true(),
             enable_discord_rpc: default_true(),
+            focus_on_sound_link: default_true(),
+            show_quick_controls: default_true(),
         }
     }
 }
