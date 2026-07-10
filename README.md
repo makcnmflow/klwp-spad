@@ -6,7 +6,7 @@
 
 ## very cool copy of soundpad for free by me klwp
 
-# TO WORK PROPORLY YOU NEED TO INSTALL https://vb-audio.com/Cable/ (VIRTUAL CABLE)
+# TO WORK PROPORLY YOU NEED TO INSTALL https://vb-audio.com/Cable/ (VIRTUAL CABLE) OR https://vac.muzychenko.net/en/ (VIRTUAL AUDIO CABLE)
 
 ### this app supports soundpad:// and voicemod:// calls so you can use websites with one click to add buttons and they will work!!!
 working websites:
